@@ -44,7 +44,12 @@ class ProcessWorker(threading.Thread):
             self.signals.status.emit(f"Processing {os.path.basename(f)}")
             try:
                 img = Image.open(f).convert("RGBA")
-                fg = remove_background(img)
+                s_per = self.settings_map.get(f, {})
+                bg_mode = s_per.get("bg_mode", "Remove background")
+                if bg_mode == "Keep original":
+                    fg = img.copy()
+                else:
+                    fg = remove_background(img)
                 if not has_foreground(fg):
                     self.signals.status.emit(f"skip (no foreground): {os.path.basename(f)}")
                 else:
@@ -171,10 +176,6 @@ class MainWindow(QMainWindow):
         ctrl.addWidget(QLabel("Background"))
         ctrl.addWidget(self.bg_mode)
 
-        btn_apply_cur = QPushButton("Apply to current")
-        btn_apply_cur.clicked.connect(self.apply_to_current)
-        ctrl.addWidget(btn_apply_cur)
-
         btn_apply_sel = QPushButton("Apply to selected")
         btn_apply_sel.clicked.connect(self.apply_to_selected)
         ctrl.addWidget(btn_apply_sel)
@@ -184,13 +185,18 @@ class MainWindow(QMainWindow):
         btn_apply_all.clicked.connect(self.apply_to_all)
         ctrl.addWidget(btn_apply_all)
 
+        btn_remove = QPushButton("Remove Selected")
+        btn_remove.clicked.connect(self.remove_selected)
+        ctrl.addWidget(btn_remove)
+
         btn_proc = QPushButton("Process All")
         btn_proc.clicked.connect(self.process_all)
         ctrl.addWidget(btn_proc)
-        btn_proc.clicked.connect(self.process_all)
-        ctrl.addWidget(btn_proc)
-        btn_proc.clicked.connect(self.process_all)
-        ctrl.addWidget(btn_proc)
+
+        btn_proc_cur = QPushButton("Process Current")
+        btn_proc_cur.clicked.connect(self.process_current)
+        ctrl.addWidget(btn_proc_cur)
+
         btn_cancel = QPushButton("Cancel")
         btn_cancel.clicked.connect(self.cancel_proc)
         ctrl.addWidget(btn_cancel)
@@ -214,6 +220,30 @@ class MainWindow(QMainWindow):
         self.gallery.setResizeMode(QListView.ResizeMode.Adjust)
         self.gallery.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.gallery.itemClicked.connect(self._on_gallery_click)
+        self.gallery.setWordWrap(True)
+        self.gallery.setStyleSheet("""
+            QListWidget {
+                background: #2b2b2b;
+                border: 1px solid #444;
+                outline: none;
+            }
+            QListWidget::item {
+                background: #333;
+                border: 1px solid #444;
+                padding: 6px;
+                margin: 4px;
+                color: #ddd;
+            }
+            QListWidget::item:selected {
+                background: #3d5a80;
+                border: 2px solid #98c1d9;
+                color: #fff;
+            }
+            QListWidget::item:hover:!selected {
+                background: #3a3a3a;
+                border: 1px solid #666;
+            }
+        """)
         gallery_scroll = QScrollArea()
         gallery_scroll.setWidgetResizable(True)
         gallery_scroll.setWidget(self.gallery)
@@ -294,6 +324,10 @@ class MainWindow(QMainWindow):
     def _on_bg_mode_changed(self, text):
         if self._sample_img is None or not self._current_file:
             return
+        # persist bg mode choice per image
+        st = self.image_settings.get(self._current_file, {})
+        st["bg_mode"] = text
+        self.image_settings[self._current_file] = st
         if text == "Remove background":
             self.remove_bg_preview()
         elif text == "Keep original":
@@ -305,8 +339,15 @@ class MainWindow(QMainWindow):
     def _populate_gallery(self):
         self.gallery.clear()
         for p in self.files:
-            item = QListWidgetItem(os.path.basename(p))
+            name = os.path.basename(p)
+            # show a tiny badge if background removal already applied
+            if p in self.image_fg:
+                name = name + "  [bg removed]"
+            item = QListWidgetItem(name)
             item.setData(Qt.ItemDataRole.UserRole, p)
+            item.setToolTip(p)  # full path on hover
+            # give each item enough room for wrapped text (2–3 lines) beneath the 80px thumb
+            item.setSizeHint(QSize(110, 130))
             try:
                 pix = QPixmap(p)
                 if not pix.isNull():
@@ -321,11 +362,19 @@ class MainWindow(QMainWindow):
             self._current_file = p
             self._sample_img = Image.open(p).convert("RGBA")
             self._sample_fg = self.image_fg.get(p)
-            # set bg_mode combo based on whether fg differs from original
-            if self._sample_fg is not None:
-                self.bg_mode.setCurrentText("Remove background")
+            # determine bg_mode from saved settings, falling back to fg presence
+            st = self.image_settings.get(p, {})
+            saved_mode = st.get("bg_mode")
+            if saved_mode in ("Keep original", "Remove background"):
+                mode = saved_mode
+            elif self._sample_fg is not None:
+                mode = "Remove background"
             else:
-                self.bg_mode.setCurrentText("Keep original")
+                mode = "Keep original"
+            if self.bg_mode.currentText() == mode:
+                self._on_bg_mode_changed(mode)
+            else:
+                self.bg_mode.setCurrentText(mode)
             s = self.image_settings.get(p)
             if s:
                 self.spin_w.setValue(s["w"]); self.spin_h.setValue(s["h"])
@@ -390,17 +439,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.status_label.setText(f"apply err: {e}")
 
-    def apply_to_current(self):
-        try:
-            if not self._current_file:
-                self.status_label.setText("No current image")
-                return
-            self.image_settings[self._current_file] = self._current_settings()
-            self.update_preview()
-            self.status_label.setText(f"Applied settings to {os.path.basename(self._current_file)}")
-        except Exception as e:
-            self.status_label.setText(f"apply err: {e}")
-
     def apply_to_all(self):
         if not self.files:
             QMessageBox.warning(self, "No files", "Select a folder first")
@@ -409,24 +447,55 @@ class MainWindow(QMainWindow):
         os.makedirs(self.out_dir, exist_ok=True)
         try:
             s = self._current_settings()
+            s["bg_mode"] = self.bg_mode.currentText()
             for p in self.files:
                 self.image_settings[p] = s
             self.update_preview()
             self.status_label.setText(f"Applied settings to all {len(self.files)} images")
         except Exception as e:
             self.status_label.setText(f"apply err: {e}")
-        self.progress.setMaximum(len(self.files))
-        self.progress.setValue(0)
-        self.worker = ProcessWorker(self.files, self.out_dir, self.spin_w.value(),
-                                   self.spin_h.value(), self._margins(),
-                                   self.anchor.currentText(), self._fill(),
-                                   self.fmt.currentText(), self.signals,
-                                   settings_map=self.image_settings)
-        self.worker.start()
+        self.status_label.setText("Applied settings to all images. Use Process All to export.")
 
     def cancel_proc(self):
         if getattr(self, "worker", None):
             self.worker.cancel = True
+
+    def remove_selected(self):
+        if not self.files:
+            QMessageBox.warning(self, "No files", "No images to remove")
+            return
+        selected_items = self.gallery.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No selection", "Select one or more images in the gallery to remove")
+            return
+        to_remove = [it.data(Qt.ItemDataRole.UserRole) for it in selected_items]
+        removed_count = 0
+        for p in to_remove:
+            if p in self.files:
+                self.files.remove(p)
+                removed_count += 1
+            self.image_settings.pop(p, None)
+            self.image_fg.pop(p, None)
+        self._populate_gallery()
+        if self._current_file in to_remove:
+            if self.files:
+                self._current_file = self.files[0]
+                first_item = self.gallery.item(0)
+                if first_item:
+                    self.gallery.setCurrentItem(first_item)
+                    self._on_gallery_click(first_item)
+            else:
+                self._current_file = None
+                self._sample_img = None
+                self._sample_fg = None
+                self.preview_before.clear()
+                self.preview_after.clear()
+                self.status_label.setText(f"Removed {removed_count} image(s). No images left.")
+                self.file_count.setText("0 images found")
+                return
+        self.file_count.setText(f"{len(self.files)} images found")
+        self.status_label.setText(f"Removed {removed_count} image(s)")
+
 
     def process_all(self):
         if not self.files:
@@ -435,12 +504,41 @@ class MainWindow(QMainWindow):
         os.makedirs(self.out_dir, exist_ok=True)
         self.progress.setMaximum(len(self.files))
         self.progress.setValue(0)
-        self.worker = ProcessWorker(self.files, self.out_dir, self.spin_w.value(),
-                                   self.spin_h.value(), self._margins(),
-                                   self.anchor.currentText(), self._fill(),
-                                   self.fmt.currentText(), self.signals,
-                                   settings_map=self.image_settings)
+        self.worker = ProcessWorker(
+            self.files, self.out_dir,
+            self.spin_w.value(), self.spin_h.value(), self._margins(),
+            self.anchor.currentText(), self._fill(), self.fmt.currentText(),
+            self.signals, settings_map=self.image_settings,
+        )
+        self.signals.progress.connect(self.on_progress)
+        self.signals.finished.connect(self.on_finished)
         self.worker.start()
+        self.status_label.setText(f"Processing {len(self.files)} images...")
+
+
+    def process_current(self):
+        if not self._current_file:
+            self.status_label.setText("No current image")
+            return
+        self.out_dir = os.path.join(os.path.dirname(self.files[0]), "output")
+        os.makedirs(self.out_dir, exist_ok=True)
+        s = self.image_settings.get(self._current_file, {})
+        self.progress.setMaximum(1)
+        self.progress.setValue(0)
+        self.worker = ProcessWorker(
+            [self._current_file], self.out_dir,
+            s.get("w", self.spin_w.value()),
+            s.get("h", self.spin_h.value()),
+            s.get("margins", self._margins()),
+            s.get("anchor", self.anchor.currentText()),
+            s.get("fill", self._fill()),
+            self.fmt.currentText(), self.signals,
+            settings_map=self.image_settings,
+        )
+        self.signals.progress.connect(self.on_progress)
+        self.signals.finished.connect(self.on_finished)
+        self.worker.start()
+        self.status_label.setText(f"Processing {os.path.basename(self._current_file)}...")
 
 
     def on_progress(self, done, total):
