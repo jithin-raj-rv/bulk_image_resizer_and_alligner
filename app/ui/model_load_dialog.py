@@ -74,7 +74,7 @@ class ModelLoadDialog(QDialog):
             Qt.WindowType.Dialog
             | Qt.WindowType.WindowTitleHint
             | Qt.WindowType.WindowCloseButtonHint
-            | Qt.WindowType.MsWindowsFixedSizeDialogHint
+            | Qt.WindowType.MSWindowsFixedSizeDialogHint
         )
         self.setMinimumWidth(420)
         self._download_complete = False

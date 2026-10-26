@@ -1,12 +1,18 @@
-import os, sys, threading, gc
+import os, sys, threading, gc, time
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QSlider, QSpinBox, QComboBox, QFileDialog, QProgressBar,
+    QPushButton, QLabel, QSlider, QSpinBox, QComboBox, QCheckBox, QFileDialog, QProgressBar,
     QMessageBox, QFrame, QListWidget, QListWidgetItem, QAbstractItemView, QListView, QScrollArea)
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QSize
 from PyQt6.QtGui import QPixmap, QImage, QIcon
 from PIL import Image, ImageDraw
 from app.core.bg_remover import remove_background, has_foreground
 from app.core.aligner import Margins, align
+
+
+def resource_path(relative_path):
+    """Get absolute path to a resource, works for dev and for PyInstaller _MEIPASS."""
+    base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
 
 
 class PreviewSignals(QObject):
@@ -16,11 +22,15 @@ class WorkerSignals(QObject):
     progress = pyqtSignal(int, int)
     status = pyqtSignal(str)
     finished = pyqtSignal()
+    finished_summary = pyqtSignal(dict)
     error = pyqtSignal(str)
+    # Emitted when the worker needs the user to decide.
+    # (file_ref, message, kind)  kind in {"lock", "conflict"}
+    file_decision_needed = pyqtSignal(str, str, str)
 
 
 class ProcessWorker(threading.Thread):
-    def __init__(self, files, out_dir, canvas_w, canvas_h, margins, anchor, fill, fmt, signals, settings_map=None, fg_map=None, overwrite_existing=True):
+    def __init__(self, files, out_dir, canvas_w, canvas_h, margins, anchor, fill, fmt, signals, settings_map=None, fg_map=None, overwrite_existing=True, conflict_policy="overwrite", apply_to_all_conflict=True, max_retries=3, retry_delay=1.5):
         super().__init__(daemon=True)
         self.files = files
         self.out_dir = out_dir
@@ -35,32 +45,61 @@ class ProcessWorker(threading.Thread):
         self.settings_map = settings_map or {}
         self.fg_map = fg_map or {}
         self.overwrite_existing = overwrite_existing
+        if conflict_policy == "overwrite" and not overwrite_existing:
+            conflict_policy = "skip"
+        self.conflict_policy = conflict_policy
+        self.apply_to_all_conflict = apply_to_all_conflict
+        self.max_retries = max(1, int(max_retries))
+        self.retry_delay = float(retry_delay)
+        # Per-file user-decision protocol (worker blocks until GUI replies).
+        self.decision = None
+        self.decision_apply_all = False
+        self.decision_event = threading.Event()
+        # Stored "apply to all" decisions (once the user ticks the box).
+        self._stored_lock_decision = None
+        self._stored_conflict_decision = None
 
     def run(self):
         os.makedirs(self.out_dir, exist_ok=True)
         total = len(self.files)
+        stats = {
+            "ok": 0, "overwritten": 0, "renamed": 0,
+            "skipped_no_fg": 0, "skipped_exists": 0, "skipped_locked": 0, "failed": 0,
+        }
+        failed_files = []
         for i, f in enumerate(self.files):
             if self.cancel:
                 self.signals.status.emit("Cancelled")
                 break
             self.signals.status.emit(f"Processing {os.path.basename(f)}")
+            img = None
             try:
                 s_per = self.settings_map.get(f, {})
                 bg_mode = s_per.get("bg_mode", "Remove background")
-                img = None
                 # Use cached foreground (edited preview) when available so
                 # re-processing after edits exports the edited image.
                 fg = self.fg_map.get(f)
                 if fg is not None:
                     fg = fg.copy()
                 else:
-                    img = Image.open(f).convert("RGBA")
+                    # --- open source image (may be locked by another app) ---
+                    img = self._open_with_retry(f)
+                    if img is None:
+                        # User chose skip/abort for a locked source file.
+                        if self.cancel:
+                            self.signals.status.emit("Aborted by user")
+                            break
+                        stats["skipped_locked"] += 1
+                        failed_files.append((f, "source file is open in another app"))
+                        self.signals.status.emit(f"skip (locked): {os.path.basename(f)}")
+                        continue
                     if bg_mode == "Keep original":
                         fg = img.copy()
                     else:
                         fg = remove_background(img)
                 if not has_foreground(fg):
                     self.signals.status.emit(f"skip (no foreground): {os.path.basename(f)}")
+                    stats["skipped_no_fg"] += 1
                 else:
                     s = self.settings_map.get(f, {})
                     cw = s.get("w", self.canvas_w)
@@ -74,19 +113,161 @@ class ProcessWorker(threading.Thread):
                     out_path = os.path.join(self.out_dir, f"{stem}_processed.{ext}")
                     if self.fmt == "jpg":
                         canvas = canvas.convert("RGB")
-                    existed = os.path.exists(out_path)
-                    if existed and not self.overwrite_existing:
+
+                    # --- resolve existing-file conflict ---
+                    final_path, action, skip = self._resolve_out_path(f, out_path)
+                    if skip:
+                        stats["skipped_exists"] += 1
                         self.signals.status.emit(f"skip (exists): {os.path.basename(out_path)}")
+                        continue
+
+                    # --- save destination (may be locked by another app) ---
+                    saved = self._save_with_retry(canvas, final_path, f)
+                    if not saved:
+                        if self.cancel:
+                            self.signals.status.emit("Aborted by user")
+                            break
+                        stats["skipped_locked"] += 1
+                        failed_files.append((final_path, "output file is open in another app"))
+                        self.signals.status.emit(f"skip (locked): {os.path.basename(final_path)}")
+                        continue
+
+                    if action == "overwritten":
+                        stats["overwritten"] += 1
+                        self.signals.status.emit(f"overwritten: {os.path.basename(final_path)}")
+                    elif action == "renamed":
+                        stats["renamed"] += 1
+                        self.signals.status.emit(f"renamed: {os.path.basename(final_path)}")
                     else:
-                        canvas.save(out_path)
-                        note = "overwritten" if existed else "done"
-                        self.signals.status.emit(f"{note}: {os.path.basename(out_path)}")
-                del img, fg
-                gc.collect()
+                        stats["ok"] += 1
+                        self.signals.status.emit(f"saved: {os.path.basename(final_path)}")
             except Exception as e:
+                stats["failed"] += 1
+                failed_files.append((f, str(e)))
                 self.signals.error.emit(f"{f}: {e}")
+            finally:
+                try:
+                    if img is not None:
+                        img.close()
+                except Exception:
+                    pass
             self.signals.progress.emit(i + 1, total)
+
         self.signals.finished.emit()
+        self.signals.finished_summary.emit({
+            "stats": stats,
+            "failed_files": failed_files,
+            "out_dir": self.out_dir,
+        })
+
+    # ------------------------------------------------------------------
+    # Retry helpers for files locked by another app
+    # ------------------------------------------------------------------
+    def _open_with_retry(self, path):
+        """Open an image, retrying on locked-file errors. Prompts the user
+        when retries are exhausted. Returns None on skip/abort/cancel."""
+        while True:
+            last_err = None
+            for attempt in range(1, self.max_retries + 1):
+                if self.cancel:
+                    return None
+                try:
+                    return Image.open(path).convert("RGBA")
+                except (OSError, PermissionError) as e:
+                    last_err = e
+                    if attempt < self.max_retries:
+                        time.sleep(self.retry_delay)
+            decision = self._prompt(path,
+                                    f"Source image is open in another app:\n{os.path.basename(path)}\n({last_err})",
+                                    "lock")
+            if decision == "retry":
+                continue
+            if decision == "skip":
+                return None
+            # abort
+            self.cancel = True
+            return None
+
+    def _save_with_retry(self, canvas, out_path, source_label):
+        """Save the canvas, retrying on locked-file errors. Prompts the user
+        when retries are exhausted. Returns False on skip/abort/cancel."""
+        while True:
+            last_err = None
+            for attempt in range(1, self.max_retries + 1):
+                if self.cancel:
+                    return False
+                try:
+                    canvas.save(out_path)
+                    return True
+                except (OSError, PermissionError) as e:
+                    last_err = e
+                    if attempt < self.max_retries:
+                        time.sleep(self.retry_delay)
+            decision = self._prompt(source_label,
+                                    f"Output file is open in another app:\n{os.path.basename(out_path)}\n({last_err})",
+                                    "lock")
+            if decision == "retry":
+                continue
+            if decision == "skip":
+                return False
+            self.cancel = True
+            return False
+
+    def _resolve_out_path(self, f, out_path):
+        """Resolve an existing output file according to conflict policy.
+        Returns (final_path, action, skip) where skip=True means skip this file."""
+        if not os.path.exists(out_path):
+            return out_path, "ok", False
+        policy = self.conflict_policy
+        if policy == "overwrite" and not self.overwrite_existing:
+            policy = "skip"
+        if policy == "skip":
+            return out_path, "ok", True
+        if policy == "overwrite":
+            return out_path, "overwritten", False
+        if policy == "rename":
+            stem, ext = os.path.splitext(out_path)
+            counter = 2
+            candidate = f"{stem}_{counter}{ext}"
+            while os.path.exists(candidate):
+                counter += 1
+                candidate = f"{stem}_{counter}{ext}"
+            return candidate, "renamed", False
+        # "ask" -> prompt the user (with optional apply-to-all)
+        decision = self._prompt(f,
+                                f"Output file already exists:\n{os.path.basename(out_path)}\nChoose how to handle it.",
+                                "conflict")
+        if decision == "overwrite":
+            return out_path, "overwritten", False
+        if decision == "rename":
+            stem, ext = os.path.splitext(out_path)
+            counter = 2
+            candidate = f"{stem}_{counter}{ext}"
+            while os.path.exists(candidate):
+                counter += 1
+                candidate = f"{stem}_{counter}{ext}"
+            return candidate, "renamed", False
+        # skip / cancel / abort
+        return out_path, "ok", True
+
+    def _prompt(self, file_ref, message, kind):
+        """Show a decision dialog on the GUI thread and block until it answers.
+        Honors any stored "apply to all" decision. Returns the chosen decision."""
+        stored = self._stored_lock_decision if kind == "lock" else self._stored_conflict_decision
+        if stored is not None:
+            return stored
+        self.decision = None
+        self.decision_apply_all = False
+        self.decision_event.clear()
+        self.signals.file_decision_needed.emit(file_ref, message, kind)
+        self.decision_event.wait()
+        decision = self.decision or "skip"
+        if self.decision_apply_all:
+            if kind == "lock":
+                self._stored_lock_decision = decision
+            else:
+                self._stored_conflict_decision = decision
+        return decision
 
 
 def pil_to_pixmap(img: Image.Image, max_w=260, max_h=260):
@@ -99,6 +280,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Bulk Image BG Remover + Resizer + Aligner")
+        self.setWindowIcon(QIcon(resource_path("logo.png")))
         self.resize(1000, 700)
         self.setMinimumSize(900, 650)
         self.files = []
@@ -117,7 +299,9 @@ class MainWindow(QMainWindow):
         self.signals.progress.connect(self.on_progress)
         self.signals.status.connect(self.status_label.setText)
         self.signals.finished.connect(self.on_finished)
+        self.signals.finished_summary.connect(self.on_finished_summary)
         self.signals.error.connect(lambda e: self.status_label.setText(f"ERR: {e}"))
+        self.signals.file_decision_needed.connect(self.on_file_decision_needed)
 
     def _build(self):
         central = QWidget()
@@ -133,6 +317,9 @@ class MainWindow(QMainWindow):
 
         self.file_count = QLabel("No files selected")
         ctrl.addWidget(self.file_count)
+        self.btn_credits = QPushButton("Credits")
+        self.btn_credits.clicked.connect(self.show_credits)
+        ctrl.addWidget(self.btn_credits)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Canvas W"))
@@ -194,6 +381,21 @@ class MainWindow(QMainWindow):
         btn_remove.clicked.connect(self.remove_selected)
         ctrl.addWidget(btn_remove)
 
+        self.conflict_combo = QComboBox()
+        self.conflict_combo.addItems([
+            "Overwrite existing",
+            "Skip existing",
+            "Rename with number",
+            "Ask per file",
+        ])
+        self.conflict_combo.setCurrentText("Overwrite existing")
+        ctrl.addWidget(QLabel("If output file already exists:"))
+        ctrl.addWidget(self.conflict_combo)
+
+        self.apply_all_conflict = QCheckBox("Apply choice to all files")
+        self.apply_all_conflict.setChecked(True)
+        ctrl.addWidget(self.apply_all_conflict)
+
         btn_proc = QPushButton("Process All")
         self.btn_proc = btn_proc
         btn_proc.clicked.connect(self.process_all)
@@ -212,7 +414,6 @@ class MainWindow(QMainWindow):
         ctrl.addWidget(self.progress)
         self.status_label = QLabel("Ready")
         ctrl.addWidget(self.status_label)
-
         right = QVBoxLayout()
         layout.addLayout(right, 1)
         self.preview_before = QLabel("Before")
@@ -332,10 +533,8 @@ class MainWindow(QMainWindow):
     def _on_bg_mode_changed(self, text):
         if self._sample_img is None or not self._current_file:
             return
-        # persist bg mode choice per image
-        st = self.image_settings.get(self._current_file, {})
-        st["bg_mode"] = text
-        self.image_settings[self._current_file] = st
+        # bg mode is only persisted when the user clicks Apply to selected /
+        # Apply to all. Here we only update the preview for the current image.
         if text == "Remove background":
             self.remove_bg_preview()
         elif text == "Keep original":
@@ -389,6 +588,15 @@ class MainWindow(QMainWindow):
                 self.sliders["top"].setValue(s["margins"].top); self.sliders["bottom"].setValue(s["margins"].bottom)
                 self.sliders["left"].setValue(s["margins"].left); self.sliders["right"].setValue(s["margins"].right)
                 self.anchor.setCurrentText(s["anchor"])
+                # restore saved fill onto the combo (triggers preview only, not a settings write)
+                saved_fill = s.get("fill")
+                if saved_fill is not None:
+                    if saved_fill == (0, 0, 0, 0):
+                        self.fill_combo.setCurrentText("transparent")
+                    elif saved_fill == (255, 255, 255, 255):
+                        self.fill_combo.setCurrentText("white")
+                    else:
+                        self.fill_combo.setCurrentText("black")
             self.update_preview()
             self.status_label.setText(f"Selected: {os.path.basename(p)}")
         except Exception as e:
@@ -458,7 +666,7 @@ class MainWindow(QMainWindow):
                     left=self.sliders["left"].value(), right=self.sliders["right"].value())
         return {"w": self.spin_w.value(), "h": self.spin_h.value(),
                 "margins": m, "anchor": self.anchor.currentText(),
-                "fill": self._fill()}
+                "fill": self._fill(), "bg_mode": self.bg_mode.currentText()}
 
     def apply_to_selected(self):
         try:
@@ -556,10 +764,21 @@ class MainWindow(QMainWindow):
 
     def _start_worker(self, files, out_dir, canvas_w, canvas_h, margins, anchor, fill, fmt, s_map, fg_map):
         self._set_processing(True, len(files))
+        policy_map = {
+            "Overwrite existing": "overwrite",
+            "Skip existing": "skip",
+            "Rename with number": "rename",
+            "Ask per file": "ask",
+        }
+        policy = policy_map.get(self.conflict_combo.currentText(), "overwrite")
         self.worker = ProcessWorker(
             files, out_dir,
             canvas_w, canvas_h, margins, anchor, fill, fmt,
             self.signals, settings_map=s_map, fg_map=fg_map,
+            conflict_policy=policy,
+            apply_to_all_conflict=self.apply_all_conflict.isChecked(),
+            max_retries=3,
+            retry_delay=1.5,
         )
         # Signals are connected once in __init__; do not reconnect here
         # to avoid stacked duplicate "Done" popups on repeated runs.
@@ -570,18 +789,17 @@ class MainWindow(QMainWindow):
             return
         if self._processing:
             return
+        # Only export images that have saved per-image settings. Live global
+        # control values are never auto-applied to images without saved settings.
+        files_to_process = [f for f in self.files if f in self.image_settings]
+        if not files_to_process:
+            self.status_label.setText("No saved settings – apply settings to images first, then Process All.")
+            return
         self.out_dir = os.path.join(os.path.dirname(self.files[0]), "output")
         os.makedirs(self.out_dir, exist_ok=True)
-        # Sync current UI settings (fill, bg_mode, etc.) to ALL images so
-        # Process All uses the latest background color regardless of stale
-        # per-image settings that may still hold a previous fill value.
-        s = self._current_settings()
-        s["bg_mode"] = self.bg_mode.currentText()
-        for p in self.files:
-            self.image_settings[p] = s
-        self.status_label.setText(f"Processing {len(self.files)} images...")
+        self.status_label.setText(f"Processing {len(files_to_process)} images...")
         self._start_worker(
-            self.files, self.out_dir,
+            files_to_process, self.out_dir,
             self.spin_w.value(), self.spin_h.value(), self._margins(),
             self.anchor.currentText(), self._fill(), self.fmt.currentText(),
             self.image_settings, self.image_fg,
@@ -595,12 +813,7 @@ class MainWindow(QMainWindow):
             return
         self.out_dir = os.path.join(os.path.dirname(self.files[0]), "output")
         os.makedirs(self.out_dir, exist_ok=True)
-        # Sync current UI settings (fill, bg_mode, etc.) to the current file
-        # so Process Current uses the latest background color regardless of
-        # stale per-image settings.
-        s = self._current_settings()
-        s["bg_mode"] = self.bg_mode.currentText()
-        self.image_settings[self._current_file] = s
+        s = self.image_settings.get(self._current_file, {})
         self.status_label.setText(f"Processing {os.path.basename(self._current_file)}...")
         self._start_worker(
             [self._current_file], self.out_dir,
@@ -621,11 +834,97 @@ class MainWindow(QMainWindow):
             return
         self._set_processing(False)
         self.status_label.setText("Done")
-        QMessageBox.information(self, "Done", f"Processed into {self.out_dir}")
+
+    def on_finished_summary(self, summary):
+        stats = summary.get("stats", {})
+        failed_files = summary.get("failed_files", [])
+        out_dir = summary.get("out_dir", "")
+        lines = [
+            f"Processed : {stats.get('ok', 0)}",
+            f"Overwritten: {stats.get('overwritten', 0)}",
+            f"Renamed   : {stats.get('renamed', 0)}",
+            f"Skipped (no foreground): {stats.get('skipped_no_fg', 0)}",
+            f"Skipped (already exists): {stats.get('skipped_exists', 0)}",
+            f"Skipped (file in use): {stats.get('skipped_locked', 0)}",
+            f"Failed    : {stats.get('failed', 0)}",
+        ]
+        if failed_files:
+            lines.append("")
+            lines.append("Failed files:")
+            for path, err in failed_files[:20]:
+                lines.append(f"  - {os.path.basename(path)}: {err}")
+            if len(failed_files) > 20:
+                lines.append(f"  ... and {len(failed_files) - 20} more")
+        msg = "\n".join(lines)
+        QMessageBox.information(self, "Process All – Summary",
+                                msg + f"\n\nOutput folder:\n{out_dir}")
+
+    def show_credits(self):
+        text = (
+            'Instagram: <a href="https://www.instagram.com/jithin_raj_rv/">jithin_raj_rv</a><br>'
+            'LinkedIn: <a href="https://www.linkedin.com/in/jithin-raj-rv/">jithin-raj-rv</a><br>'
+            'Website: <a href="https://www.jithinrajrv.com/">www.jithinrajrv.com</a><br>'
+            'GitHub: <a href="https://github.com/jithin-raj-rv/">jithin-raj-rv</a><br><br>'
+            'Made with lots of \U0001FAB2 by Jithin<br><br>'
+            'P.S. Gift me a lambar gambar'
+        )
+        box = QMessageBox(self)
+        box.setWindowTitle("Credits")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(text)
+        box.exec()
+
+    def on_file_decision_needed(self, file_ref, message, kind):
+        """User-facing dialog for locked files / existing-file conflicts.
+        Runs on the GUI thread; unblocks the worker once a choice is made."""
+        if kind == "lock":
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("File is in use")
+            box.setText(message)
+            btn_retry = box.addButton("Retry", QMessageBox.ButtonRole.ActionRole)
+            btn_skip = box.addButton("Skip", QMessageBox.ButtonRole.ActionRole)
+            btn_abort = box.addButton("Abort", QMessageBox.ButtonRole.RejectRole)
+        else:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle("Output file already exists")
+            box.setText(message)
+            btn_over = box.addButton("Overwrite", QMessageBox.ButtonRole.ActionRole)
+            btn_skip = box.addButton("Skip", QMessageBox.ButtonRole.ActionRole)
+            btn_rename = box.addButton("Rename", QMessageBox.ButtonRole.ActionRole)
+            btn_abort = box.addButton("Cancel all", QMessageBox.ButtonRole.RejectRole)
+
+        cb = QCheckBox("Apply to all remaining files")
+        cb.setChecked(self.apply_all_conflict.isChecked())
+        box.setCheckBox(cb)
+        if kind == "lock":
+            box.setDefaultButton(btn_retry)
+            box.setEscapeButton(btn_skip)
+            mapping = {btn_retry: "retry", btn_skip: "skip", btn_abort: "abort"}
+        else:
+            box.setDefaultButton(btn_over)
+            box.setEscapeButton(btn_skip)
+            mapping = {btn_over: "overwrite", btn_skip: "skip",
+                       btn_rename: "rename", btn_abort: "abort"}
+
+        box.exec()
+
+        worker = self.worker
+        if worker is not None:
+            clicked = box.clickedButton()
+            worker.decision = mapping.get(clicked, "skip")
+            worker.decision_apply_all = cb.isChecked()
+            worker.decision_event.set()
 
 
-def main():
-    app = QApplication(sys.argv)
+def create_main_window(app: QApplication | None = None, splash=None):
+    """Create and show the main window.  Called after the splash is visible.
+
+    Does NOT call app.exec() or sys.exit() — the caller owns the event loop.
+    """
+    if app is None:
+        app = QApplication(sys.argv)
 
     # ---------------------------------------------------------------
     # First-startup: download model + init ONNX session with a
@@ -655,8 +954,20 @@ def main():
         )
         sys.exit(1)
 
+    # Dismiss the early startup splash before showing the main window.
+    if splash is not None:
+        splash.close()
+        app.processEvents()
+
     w = MainWindow()
     w.show()
+
+
+def main(app: QApplication | None = None, splash=None):
+    if app is None:
+        app = QApplication(sys.argv)
+    create_main_window(app=app, splash=splash)
+    sys.exit(app.exec())
     sys.exit(app.exec())
 
 

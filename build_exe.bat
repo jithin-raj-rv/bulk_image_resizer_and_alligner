@@ -26,16 +26,23 @@ if errorlevel 1 (
     python -m pip install -r requirements.txt
 )
 
-echo [3/3] Building single-file EXE with PyInstaller ...
+echo [3/3] Building one-folder EXE with PyInstaller ...
 echo.
-:: --onefile is implicit (no COLLECT step in spec = one-file mode)
 :: --windowed is implicit (console=False in spec = no console popup)
 :: --clean: remove build cache before building
 python -m PyInstaller --clean --noconfirm bulk_image_resizer.spec
 
+:: PyInstaller creates BOTH dist\bulk_image_resizer.exe (slow one-file,
+:: extracts at runtime -> 1-2 min blank screen) AND
+:: dist\bulk_image_resizer\bulk_image_resizer.exe (fast one-folder).
+:: Delete the slow one-file EXE so only the fast one-folder version remains.
+if exist "dist\bulk_image_resizer.exe" del /q "dist\bulk_image_resizer.exe"
+
 echo.
 echo Build complete. The executable is at:
-echo   dist\bulk_image_resizer.exe
+echo   dist\bulk_image_resizer\bulk_image_resizer.exe
+echo.
+echo Run dist\bulk_image_resizer\bulk_image_resizer.exe (or launch.bat).
 echo.
 echo ============================================================
 echo NOTE: On first launch the app will download the u2net model

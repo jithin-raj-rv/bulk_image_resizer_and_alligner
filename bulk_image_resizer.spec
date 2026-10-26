@@ -46,8 +46,8 @@ a = Analysis(
     ["main.py"],
     # Ensure the 'app' package directory is discoverable at import time
     pathex=["."],
-    # Bundle the entire app/ package + package metadata
-    datas=[("app", "app")] + _metadata_datas,
+    # Bundle the entire app/ package + package metadata + logo.png + logo.ico
+    datas=[("app", "app"), ("logo.png", "."), ("logo.ico", ".")] + _metadata_datas,
     binaries=[],
     # rembg relies on dynamic imports and optional backends
     hiddenimports=[
@@ -95,6 +95,7 @@ exe = EXE(
     a.datas,
     [],
     name="bulk_image_resizer",
+    icon="logo.ico",
     debug="no",
     bootloader_ignore_signals=False,
     strip=False,
@@ -110,14 +111,15 @@ exe = EXE(
 )
 
 # -------------------------------------------------------------------
-# One-folder mode (optional): uncomment this block to produce a folder
-#   containing bulk_image_resizer.exe plus all dependency DLLs and data.
+# One-folder mode (DEFAULT): produces dist/bulk_image_resizer/ containing
+#   bulk_image_resizer.exe plus all dependency DLLs and data files.
+#   No _MEIxxxx extraction at runtime → near-instant startup, no blank screen.
 # -------------------------------------------------------------------
-# coll = COLLECT(
-#     exe,
-#     a.binaries,
-#     a.datas,
-#     strip=False,
-#     upx=True,
-#     name="bulk_image_resizer",
-# )
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    name="bulk_image_resizer",
+)
