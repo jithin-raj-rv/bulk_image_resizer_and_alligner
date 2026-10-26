@@ -1,0 +1,5 @@
+rembg>=2.0.60
+Pillow>=10.0.0
+onnxruntime>=1.18.0
+PyQt6>=6.6.0
+pyinstaller>=6.0.0
