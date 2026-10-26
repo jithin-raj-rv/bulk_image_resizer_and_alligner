@@ -112,16 +112,7 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self.prev_signals = PreviewSignals()
         self.prev_signals.done.connect(self._on_preview_fg)
-        self._model_ready = False
-        # Pre-warm model in background
-        def warmup():
-            try:
-                from rembg import new_session
-                new_session("u2net")
-                self.prev_signals.done.emit(None)
-            except Exception:
-                pass
-        threading.Thread(target=warmup, daemon=True).start()
+        self._model_ready = True  # model preloaded in main() before MainWindow
         self.signals = WorkerSignals()
         self.signals.progress.connect(self.on_progress)
         self.signals.status.connect(self.status_label.setText)
@@ -193,8 +184,6 @@ class MainWindow(QMainWindow):
         ctrl.addWidget(self.bg_mode)
 
         btn_apply_sel = QPushButton("Apply to selected")
-        btn_apply_sel.clicked.connect(self.apply_to_selected)
-        ctrl.addWidget(btn_apply_sel)
         btn_apply_sel.clicked.connect(self.apply_to_selected)
         ctrl.addWidget(btn_apply_sel)
         btn_apply_all = QPushButton("Apply to all")
@@ -583,6 +572,13 @@ class MainWindow(QMainWindow):
             return
         self.out_dir = os.path.join(os.path.dirname(self.files[0]), "output")
         os.makedirs(self.out_dir, exist_ok=True)
+        # Sync current UI settings (fill, bg_mode, etc.) to ALL images so
+        # Process All uses the latest background color regardless of stale
+        # per-image settings that may still hold a previous fill value.
+        s = self._current_settings()
+        s["bg_mode"] = self.bg_mode.currentText()
+        for p in self.files:
+            self.image_settings[p] = s
         self.status_label.setText(f"Processing {len(self.files)} images...")
         self._start_worker(
             self.files, self.out_dir,
@@ -599,7 +595,12 @@ class MainWindow(QMainWindow):
             return
         self.out_dir = os.path.join(os.path.dirname(self.files[0]), "output")
         os.makedirs(self.out_dir, exist_ok=True)
-        s = self.image_settings.get(self._current_file, {})
+        # Sync current UI settings (fill, bg_mode, etc.) to the current file
+        # so Process Current uses the latest background color regardless of
+        # stale per-image settings.
+        s = self._current_settings()
+        s["bg_mode"] = self.bg_mode.currentText()
+        self.image_settings[self._current_file] = s
         self.status_label.setText(f"Processing {os.path.basename(self._current_file)}...")
         self._start_worker(
             [self._current_file], self.out_dir,
@@ -625,6 +626,35 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+
+    # ---------------------------------------------------------------
+    # First-startup: download model + init ONNX session with a
+    # user-facing progress dialog.  This replaces the old silent
+    # background initialization.  The model is then reused by every
+    # subsequent call to remove_background().
+    # ---------------------------------------------------------------
+    from app.ui.model_load_dialog import ModelLoadDialog
+
+    dialog = ModelLoadDialog()
+    worker, thread = ModelLoadDialog.start_worker(dialog)
+    thread.started.connect(worker.run)
+    thread.start()
+    dialog.exec()  # blocks on its own event loop; worker signals update it
+
+    # Clean up thread
+    if thread.isRunning():
+        thread.quit()
+        thread.wait(2000)
+
+    if dialog.result() == 0:  # Rejected → model failed to load
+        QMessageBox.critical(
+            None,
+            "Startup Error",
+            "Could not load the background-removal model. "
+            "The application will close.",
+        )
+        sys.exit(1)
+
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
