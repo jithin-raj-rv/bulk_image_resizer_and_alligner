@@ -20,7 +20,7 @@ class WorkerSignals(QObject):
 
 
 class ProcessWorker(threading.Thread):
-    def __init__(self, files, out_dir, canvas_w, canvas_h, margins, anchor, fill, fmt, signals, settings_map=None):
+    def __init__(self, files, out_dir, canvas_w, canvas_h, margins, anchor, fill, fmt, signals, settings_map=None, fg_map=None, overwrite_existing=True):
         super().__init__(daemon=True)
         self.files = files
         self.out_dir = out_dir
@@ -33,6 +33,8 @@ class ProcessWorker(threading.Thread):
         self.signals = signals
         self.cancel = False
         self.settings_map = settings_map or {}
+        self.fg_map = fg_map or {}
+        self.overwrite_existing = overwrite_existing
 
     def run(self):
         os.makedirs(self.out_dir, exist_ok=True)
@@ -43,13 +45,20 @@ class ProcessWorker(threading.Thread):
                 break
             self.signals.status.emit(f"Processing {os.path.basename(f)}")
             try:
-                img = Image.open(f).convert("RGBA")
                 s_per = self.settings_map.get(f, {})
                 bg_mode = s_per.get("bg_mode", "Remove background")
-                if bg_mode == "Keep original":
-                    fg = img.copy()
+                img = None
+                # Use cached foreground (edited preview) when available so
+                # re-processing after edits exports the edited image.
+                fg = self.fg_map.get(f)
+                if fg is not None:
+                    fg = fg.copy()
                 else:
-                    fg = remove_background(img)
+                    img = Image.open(f).convert("RGBA")
+                    if bg_mode == "Keep original":
+                        fg = img.copy()
+                    else:
+                        fg = remove_background(img)
                 if not has_foreground(fg):
                     self.signals.status.emit(f"skip (no foreground): {os.path.basename(f)}")
                 else:
@@ -65,7 +74,13 @@ class ProcessWorker(threading.Thread):
                     out_path = os.path.join(self.out_dir, f"{stem}_processed.{ext}")
                     if self.fmt == "jpg":
                         canvas = canvas.convert("RGB")
-                    canvas.save(out_path)
+                    existed = os.path.exists(out_path)
+                    if existed and not self.overwrite_existing:
+                        self.signals.status.emit(f"skip (exists): {os.path.basename(out_path)}")
+                    else:
+                        canvas.save(out_path)
+                        note = "overwritten" if existed else "done"
+                        self.signals.status.emit(f"{note}: {os.path.basename(out_path)}")
                 del img, fg
                 gc.collect()
             except Exception as e:
@@ -92,6 +107,7 @@ class MainWindow(QMainWindow):
         self._current_file = None
         self.out_dir = None
         self.worker = None
+        self._processing = False
         self._build()
         self.setAcceptDrops(True)
         self.prev_signals = PreviewSignals()
@@ -190,10 +206,12 @@ class MainWindow(QMainWindow):
         ctrl.addWidget(btn_remove)
 
         btn_proc = QPushButton("Process All")
+        self.btn_proc = btn_proc
         btn_proc.clicked.connect(self.process_all)
         ctrl.addWidget(btn_proc)
 
         btn_proc_cur = QPushButton("Process Current")
+        self.btn_proc_cur = btn_proc_cur
         btn_proc_cur.clicked.connect(self.process_current)
         ctrl.addWidget(btn_proc_cur)
 
@@ -221,6 +239,7 @@ class MainWindow(QMainWindow):
         self.gallery.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.gallery.itemClicked.connect(self._on_gallery_click)
         self.gallery.setWordWrap(True)
+        self.gallery.setDragEnabled(False)
         self.gallery.setStyleSheet("""
             QListWidget {
                 background: #2b2b2b;
@@ -388,38 +407,69 @@ class MainWindow(QMainWindow):
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if not url.isLocalFile():
+                    event.ignore()
+                    return
+                if not url.toLocalFile():
+                    event.ignore()
+                    return
             event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            all_valid = all(url.isLocalFile() and url.toLocalFile() for url in event.mimeData().urls())
+            if all_valid:
+                event.acceptProposedAction()
+            else:
+                event.ignore()
+        else:
+            event.ignore()
 
     def dropEvent(self, event):
-        paths = []
-        for url in event.mimeData().urls():
-            p = url.toLocalFile()
-            if os.path.isdir(p):
-                for root, _, fs in os.walk(p):
-                    for f in fs:
-                        if f.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")):
-                            paths.append(os.path.join(root, f))
-            elif os.path.isfile(p):
-                paths.append(p)
-        if paths:
-            existing = set(self.files)
-            for p in paths:
-                if p not in existing:
-                    self.files.append(p)
-            self.files = sorted(self.files)
-            self._sample_img = Image.open(self.files[0]).convert("RGBA")
-            self._sample_fg = None
-            self._current_file = self.files[0] if self.files else None
-            self._populate_gallery()
-            self.status_label.setText(f"Loaded {len(self.files)} images (drag & drop)")
-            self.update_preview()
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+        try:
+            paths = []
+            for url in event.mimeData().urls():
+                if not url.isLocalFile():
+                    continue
+                p = url.toLocalFile()
+                if not p:
+                    continue
+                if os.path.isdir(p):
+                    for root, _, fs in os.walk(p):
+                        for f in fs:
+                            if f.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")):
+                                paths.append(os.path.join(root, f))
+                elif os.path.isfile(p):
+                    paths.append(p)
+            if paths:
+                existing = set(self.files)
+                for p in paths:
+                    if p not in existing:
+                        self.files.append(p)
+                self.files = sorted(self.files)
+                self._sample_img = Image.open(self.files[0]).convert("RGBA")
+                self._sample_fg = None
+                self._current_file = self.files[0] if self.files else None
+                self._populate_gallery()
+                self.status_label.setText(f"Loaded {len(self.files)} images (drag & drop)")
+                self.update_preview()
+            event.acceptProposedAction()
+        except Exception as e:
+            self.status_label.setText(f"drop err: {e}")
+            event.ignore()
 
     def _current_settings(self):
         m = Margins(top=self.sliders["top"].value(), bottom=self.sliders["bottom"].value(),
                     left=self.sliders["left"].value(), right=self.sliders["right"].value())
         return {"w": self.spin_w.value(), "h": self.spin_h.value(),
                 "margins": m, "anchor": self.anchor.currentText(),
-                "fill": (255,255,255,255) if self.fill_combo.currentText() == "white" else (0,0,0,0)}
+                "fill": self._fill()}
 
     def apply_to_selected(self):
         try:
@@ -497,53 +547,78 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Removed {removed_count} image(s)")
 
 
+    def _set_processing(self, active, n=None):
+        # Guard against duplicate/queued finished signals and re-entrancy.
+        self._processing = active
+        try:
+            self.btn_proc.setEnabled(not active)
+            self.btn_proc_cur.setEnabled(not active)
+        except Exception:
+            pass
+        if active:
+            # Indeterminate (busy) while starting; on_progress sets the real max.
+            self.progress.setMaximum(0)
+            self.progress.setValue(0)
+        else:
+            # Reset to a clean, empty (non-busy) state after export.
+            self.progress.setMaximum(1)
+            self.progress.setValue(0)
+            self.progress.setTextVisible(False)
+
+    def _start_worker(self, files, out_dir, canvas_w, canvas_h, margins, anchor, fill, fmt, s_map, fg_map):
+        self._set_processing(True, len(files))
+        self.worker = ProcessWorker(
+            files, out_dir,
+            canvas_w, canvas_h, margins, anchor, fill, fmt,
+            self.signals, settings_map=s_map, fg_map=fg_map,
+        )
+        # Signals are connected once in __init__; do not reconnect here
+        # to avoid stacked duplicate "Done" popups on repeated runs.
+        self.worker.start()
+
     def process_all(self):
         if not self.files:
             return
+        if self._processing:
+            return
         self.out_dir = os.path.join(os.path.dirname(self.files[0]), "output")
         os.makedirs(self.out_dir, exist_ok=True)
-        self.progress.setMaximum(len(self.files))
-        self.progress.setValue(0)
-        self.worker = ProcessWorker(
+        self.status_label.setText(f"Processing {len(self.files)} images...")
+        self._start_worker(
             self.files, self.out_dir,
             self.spin_w.value(), self.spin_h.value(), self._margins(),
             self.anchor.currentText(), self._fill(), self.fmt.currentText(),
-            self.signals, settings_map=self.image_settings,
+            self.image_settings, self.image_fg,
         )
-        self.signals.progress.connect(self.on_progress)
-        self.signals.finished.connect(self.on_finished)
-        self.worker.start()
-        self.status_label.setText(f"Processing {len(self.files)} images...")
-
 
     def process_current(self):
         if not self._current_file:
             self.status_label.setText("No current image")
             return
+        if self._processing:
+            return
         self.out_dir = os.path.join(os.path.dirname(self.files[0]), "output")
         os.makedirs(self.out_dir, exist_ok=True)
         s = self.image_settings.get(self._current_file, {})
-        self.progress.setMaximum(1)
-        self.progress.setValue(0)
-        self.worker = ProcessWorker(
+        self.status_label.setText(f"Processing {os.path.basename(self._current_file)}...")
+        self._start_worker(
             [self._current_file], self.out_dir,
             s.get("w", self.spin_w.value()),
             s.get("h", self.spin_h.value()),
             s.get("margins", self._margins()),
             s.get("anchor", self.anchor.currentText()),
             s.get("fill", self._fill()),
-            self.fmt.currentText(), self.signals,
-            settings_map=self.image_settings,
+            self.fmt.currentText(), self.image_settings, self.image_fg,
         )
-        self.signals.progress.connect(self.on_progress)
-        self.signals.finished.connect(self.on_finished)
-        self.worker.start()
-        self.status_label.setText(f"Processing {os.path.basename(self._current_file)}...")
-
 
     def on_progress(self, done, total):
+        self.progress.setMaximum(total)
         self.progress.setValue(done)
     def on_finished(self):
+        if not getattr(self, "_processing", False):
+            # Stale signal from a previous run; ignore to avoid duplicate popups.
+            return
+        self._set_processing(False)
         self.status_label.setText("Done")
         QMessageBox.information(self, "Done", f"Processed into {self.out_dir}")
 
