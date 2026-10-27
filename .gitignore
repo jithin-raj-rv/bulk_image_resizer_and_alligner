@@ -1,0 +1,40 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Build artifacts
+build/
+dist/
+*.exe
+*.zip
+build.log
+gui.err
+
+# Test output
+out_test/
+out/
+
+# Downloaded model cache (rembg u2net, ~176 MB, auto-downloaded at runtime)
+# Stored under the user's home dir (~/.rembg); not part of this repo.
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# PyInstaller
+*.manifest
+*.spec.bak
