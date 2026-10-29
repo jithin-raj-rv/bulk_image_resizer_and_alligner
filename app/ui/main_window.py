@@ -302,7 +302,13 @@ class MainWindow(QMainWindow):
         self.prev_signals = PreviewSignals()
         self.prev_signals.done.connect(self._on_preview_fg)
         self._model_ready = True  # model preloaded in main() before MainWindow
+        # Default processing settings (persisted to JSON)
+        self.default_settings = {}
+        self._defaults_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "default_settings.json"
+        )
         self._load_custom_colors()
+        self._load_default_settings()
         self.signals = WorkerSignals()
         self.signals.progress.connect(self.on_progress)
         self.signals.status.connect(self.status_label.setText)
@@ -404,6 +410,10 @@ class MainWindow(QMainWindow):
         btn_apply_all = QPushButton("Apply to all")
         btn_apply_all.clicked.connect(self.apply_to_all)
         ctrl.addWidget(btn_apply_all)
+        btn_set_default = QPushButton("Set as Default")
+        btn_set_default.setToolTip("Save current settings as defaults for all newly added images")
+        btn_set_default.clicked.connect(self._set_defaults)
+        ctrl.addWidget(btn_set_default)
 
         btn_remove = QPushButton("Remove Selected")
         btn_remove.clicked.connect(self.remove_selected)
@@ -505,6 +515,8 @@ class MainWindow(QMainWindow):
                 self._current_file = self.files[0] if self.files else None
                 self._populate_gallery()
                 self.update_preview()
+            # Auto-apply default settings to all newly loaded images
+            self._apply_defaults_to_new_files(self.files)
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
             self.status_label.setText(f"err: {e}")
@@ -806,9 +818,9 @@ class MainWindow(QMainWindow):
                     paths.append(p)
             if paths:
                 existing = set(self.files)
-                for p in paths:
-                    if p not in existing:
-                        self.files.append(p)
+                new_paths = [p for p in paths if p not in existing]
+                for p in new_paths:
+                    self.files.append(p)
                 self.files = sorted(self.files)
                 self._sample_img = Image.open(self.files[0]).convert("RGBA")
                 self._sample_fg = None
@@ -816,6 +828,9 @@ class MainWindow(QMainWindow):
                 self._populate_gallery()
                 self.status_label.setText(f"Loaded {len(self.files)} images (drag & drop)")
                 self.update_preview()
+                # Auto-apply default settings to newly added images
+                if new_paths:
+                    self._apply_defaults_to_new_files(new_paths)
             event.acceptProposedAction()
         except Exception as e:
             self.status_label.setText(f"drop err: {e}")
@@ -827,6 +842,87 @@ class MainWindow(QMainWindow):
         return {"w": self.spin_w.value(), "h": self.spin_h.value(),
                 "margins": m, "anchor": self.anchor.currentText(),
                 "fill": self._fill(), "bg_mode": self.bg_mode.currentText()}
+
+    # ------------------------------------------------------------------
+    # Default settings persistence
+    # ------------------------------------------------------------------
+    def _save_default_settings(self):
+        """Persist default settings to JSON file."""
+        try:
+            data = {
+                "w": self.default_settings.get("w", self.spin_w.value()),
+                "h": self.default_settings.get("h", self.spin_h.value()),
+                "margins": {
+                    "top": self.default_settings.get("margins", Margins()).top,
+                    "bottom": self.default_settings.get("margins", Margins()).bottom,
+                    "left": self.default_settings.get("margins", Margins()).left,
+                    "right": self.default_settings.get("margins", Margins()).right,
+                },
+                "anchor": self.default_settings.get("anchor", self.anchor.currentText()),
+                "fill": list(self.default_settings.get("fill", self._fill())),
+                "bg_mode": self.default_settings.get("bg_mode", self.bg_mode.currentText()),
+            }
+            with open(self._defaults_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except OSError as e:
+            QMessageBox.critical(self, "Error", f"Could not save default settings: {e}")
+            raise
+
+    def _load_default_settings(self):
+        """Load default settings from JSON file."""
+        try:
+            if os.path.isfile(self._defaults_path):
+                with open(self._defaults_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    m = Margins(
+                        top=data.get("margins", {}).get("top", 0),
+                        bottom=data.get("margins", {}).get("bottom", 0),
+                        left=data.get("margins", {}).get("left", 0),
+                        right=data.get("margins", {}).get("right", 0),
+                    )
+                    fill = data.get("fill", [0, 0, 0, 255])
+                    self.default_settings = {
+                        "w": data.get("w", 0),
+                        "h": data.get("h", 0),
+                        "margins": m,
+                        "anchor": data.get("anchor", "center"),
+                        "fill": tuple(fill) if isinstance(fill, list) and len(fill) == 4 else (0, 0, 0, 255),
+                        "bg_mode": data.get("bg_mode", "Remove background"),
+                    }
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
+            self.status_label.setText(f"Warning: could not load default settings: {e}")
+            self.default_settings = {}
+
+    def _set_defaults(self):
+        """Save current UI settings as the default for all new images."""
+        try:
+            s = self._current_settings()
+            self.default_settings = dict(s)
+            self._save_default_settings()
+            # Apply defaults to all currently loaded images too
+            if self.files:
+                for p in self.files:
+                    if p not in self.image_settings:
+                        self.image_settings[p] = dict(s)
+            self.status_label.setText("Default settings saved. New images will use these automatically.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not set defaults: {e}")
+
+    def _apply_defaults_to_new_files(self, paths):
+        """Apply saved default settings to a list of newly added file paths."""
+        if not self.default_settings:
+            return
+        s = dict(self.default_settings)
+        applied = 0
+        for p in paths:
+            if p not in self.image_settings:
+                self.image_settings[p] = s
+                applied += 1
+        if applied:
+            self.status_label.setText(
+                f"Default settings applied to {applied} new image(s)."
+            )
 
     def apply_to_selected(self):
         try:
