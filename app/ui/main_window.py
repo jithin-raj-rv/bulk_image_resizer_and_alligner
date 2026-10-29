@@ -1,7 +1,8 @@
-import os, sys, threading, gc, time
+import os, sys, threading, gc, time, json
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QSpinBox, QComboBox, QCheckBox, QFileDialog, QProgressBar,
-    QMessageBox, QFrame, QListWidget, QListWidgetItem, QAbstractItemView, QListView, QScrollArea)
+    QMessageBox, QFrame, QListWidget, QListWidgetItem, QAbstractItemView, QListView, QScrollArea,
+    QLineEdit)
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QSize
 from PyQt6.QtGui import QPixmap, QImage, QIcon
 from PIL import Image, ImageDraw
@@ -290,11 +291,18 @@ class MainWindow(QMainWindow):
         self.out_dir = None
         self.worker = None
         self._processing = False
+        # Custom background colors (display name -> RGBA tuple)
+        # Must be initialized before _build() because _refresh_fill_combo() reads it.
+        self.custom_colors = {}
+        self._custom_colors_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "custom_colors.json"
+        )
         self._build()
         self.setAcceptDrops(True)
         self.prev_signals = PreviewSignals()
         self.prev_signals.done.connect(self._on_preview_fg)
         self._model_ready = True  # model preloaded in main() before MainWindow
+        self._load_custom_colors()
         self.signals = WorkerSignals()
         self.signals.progress.connect(self.on_progress)
         self.signals.status.connect(self.status_label.setText)
@@ -354,10 +362,30 @@ class MainWindow(QMainWindow):
         ctrl.addWidget(self.anchor)
 
         self.fill_combo = QComboBox()
-        self.fill_combo.addItems(["transparent", "white", "black", "#EEEFF1"])
+        self._refresh_fill_combo()
         self.fill_combo.currentTextChanged.connect(self.update_preview)
         ctrl.addWidget(QLabel("Background fill"))
         ctrl.addWidget(self.fill_combo)
+
+        # --- Custom color management ---
+        custom_row = QHBoxLayout()
+        self.custom_name = QLineEdit()
+        self.custom_name.setPlaceholderText("Color name (e.g. My Brand)")
+        self.custom_name.setFixedWidth(160)
+        custom_row.addWidget(self.custom_name)
+        self.custom_hex = QLineEdit()
+        self.custom_hex.setPlaceholderText("Hex code (e.g. #EEEFF1)")
+        self.custom_hex.setFixedWidth(130)
+        custom_row.addWidget(self.custom_hex)
+        btn_add_color = QPushButton("Add Color")
+        btn_add_color.setFixedWidth(90)
+        btn_add_color.clicked.connect(self._add_custom_color)
+        custom_row.addWidget(btn_add_color)
+        ctrl.addLayout(custom_row)
+
+        btn_del_color = QPushButton("Delete Selected Color")
+        btn_del_color.clicked.connect(self._delete_custom_color)
+        ctrl.addWidget(btn_del_color)
 
         self.fmt = QComboBox()
         self.fmt.addItems(["png", "jpg"])
@@ -487,14 +515,130 @@ class MainWindow(QMainWindow):
                       left=self.sliders["left"].value(),
                       right=self.sliders["right"].value())
 
+    # ------------------------------------------------------------------
+    # Custom color management
+    # ------------------------------------------------------------------
+    BUILTIN_FILLS = {"transparent", "white", "black", "Light Grey"}
+
+    def _builtin_rgba(self, name: str):
+        if name == "transparent":
+            return (0, 0, 0, 0)
+        if name == "white":
+            return (255, 255, 255, 255)
+        if name == "Light Grey":
+            return (238, 239, 241, 255)
+        if name == "black":
+            return (0, 0, 0, 255)
+        return None
+
+    def _validate_hex(self, hex_str: str):
+        """Return (r, g, b, a) tuple if *hex_str* is a valid #RRGGBB color, else None."""
+        s = hex_str.strip()
+        if not s.startswith("#") or len(s) != 7:
+            return None
+        try:
+            r = int(s[1:3], 16)
+            g = int(s[3:5], 16)
+            b = int(s[5:7], 16)
+        except ValueError:
+            return None
+        return (r, g, b, 255)
+
+    def _refresh_fill_combo(self):
+        """Rebuild the fill combo from built-ins + custom colors."""
+        current = self.fill_combo.currentText()
+        self.fill_combo.clear()
+        self.fill_combo.addItems(["transparent", "white", "black", "Light Grey"])
+        for name in self.custom_colors:
+            self.fill_combo.addItem(name)
+        # Restore previous selection if it still exists
+        index = self.fill_combo.findText(current)
+        if index >= 0:
+            self.fill_combo.setCurrentIndex(index)
+
+    def _load_custom_colors(self):
+        """Load custom colors from the JSON persistence file."""
+        try:
+            if os.path.isfile(self._custom_colors_path):
+                with open(self._custom_colors_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    for name, rgba in data.items():
+                        if isinstance(rgba, list) and len(rgba) == 4:
+                            self.custom_colors[name] = tuple(rgba)
+        except (json.JSONDecodeError, OSError) as e:
+            self.status_label.setText(f"Warning: could not load custom colors: {e}")
+
+    def _save_custom_colors(self):
+        """Persist custom colors to the JSON file."""
+        try:
+            data = {name: list(rgba) for name, rgba in self.custom_colors.items()}
+            with open(self._custom_colors_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except OSError as e:
+            QMessageBox.critical(self, "Error", f"Could not save custom colors: {e}")
+
+    def _add_custom_color(self):
+        """Add a user-defined color from the name/hex inputs."""
+        name = self.custom_name.text().strip()
+        hex_str = self.custom_hex.text().strip()
+
+        if not name:
+            QMessageBox.warning(self, "Invalid input", "Please enter a color name.")
+            return
+        if not hex_str:
+            QMessageBox.warning(self, "Invalid input", "Please enter a hex color code.")
+            return
+
+        rgba = self._validate_hex(hex_str)
+        if rgba is None:
+            QMessageBox.warning(
+                self,
+                "Invalid color",
+                f"'{hex_str}' is not a valid hex color. Use format #RRGGBB (e.g. #EEEFF1).",
+            )
+            return
+
+        if name in self.BUILTIN_FILLS or name in self.custom_colors:
+            QMessageBox.warning(
+                self, "Duplicate name", f"A color named '{name}' already exists."
+            )
+            return
+
+        self.custom_colors[name] = rgba
+        self._save_custom_colors()
+        self._refresh_fill_combo()
+        self.fill_combo.setCurrentText(name)
+        self.custom_name.clear()
+        self.custom_hex.clear()
+        self.update_preview()
+        self.status_label.setText(f"Added custom color '{name}' ({hex_str})")
+
+    def _delete_custom_color(self):
+        """Delete the currently selected custom color from the combo."""
+        name = self.fill_combo.currentText()
+        if name in self.BUILTIN_FILLS:
+            QMessageBox.warning(
+                self, "Cannot delete", f"'{name}' is a built-in color and cannot be deleted."
+            )
+            return
+        if name not in self.custom_colors:
+            QMessageBox.warning(self, "Not a custom color", "Select a custom color to delete.")
+            return
+
+        del self.custom_colors[name]
+        self._save_custom_colors()
+        self._refresh_fill_combo()
+        self.update_preview()
+        self.status_label.setText(f"Deleted custom color '{name}'")
+
     def _fill(self):
         v = self.fill_combo.currentText()
-        if v == "transparent":
-            return (0, 0, 0, 0)
-        if v == "white":
-            return (255, 255, 255, 255)
-        if v == "#EEEFF1":
-            return (238, 239, 241, 255)
+        if v in self.custom_colors:
+            return self.custom_colors[v]
+        rgba = self._builtin_rgba(v)
+        if rgba is not None:
+            return rgba
         return (0, 0, 0, 255)
 
     def update_preview(self):
@@ -593,12 +737,24 @@ class MainWindow(QMainWindow):
                 # restore saved fill onto the combo (triggers preview only, not a settings write)
                 saved_fill = s.get("fill")
                 if saved_fill is not None:
+                    # Try built-in colors first
+                    name = None
                     if saved_fill == (0, 0, 0, 0):
-                        self.fill_combo.setCurrentText("transparent")
+                        name = "transparent"
                     elif saved_fill == (255, 255, 255, 255):
-                        self.fill_combo.setCurrentText("white")
+                        name = "white"
                     elif saved_fill == (238, 239, 241, 255):
-                        self.fill_combo.setCurrentText("#EEEFF1")
+                        name = "Light Grey"
+                    elif saved_fill == (0, 0, 0, 255):
+                        name = "black"
+                    # Then try custom colors
+                    if name is None:
+                        for cname, crgba in self.custom_colors.items():
+                            if crgba == saved_fill:
+                                name = cname
+                                break
+                    if name is not None:
+                        self.fill_combo.setCurrentText(name)
                     else:
                         self.fill_combo.setCurrentText("black")
             self.update_preview()
