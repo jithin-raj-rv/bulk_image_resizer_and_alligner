@@ -354,7 +354,7 @@ class MainWindow(QMainWindow):
         ctrl.addWidget(self.anchor)
 
         self.fill_combo = QComboBox()
-        self.fill_combo.addItems(["transparent", "white", "black"])
+        self.fill_combo.addItems(["transparent", "white", "black", "#EEEFF1"])
         self.fill_combo.currentTextChanged.connect(self.update_preview)
         ctrl.addWidget(QLabel("Background fill"))
         ctrl.addWidget(self.fill_combo)
@@ -493,6 +493,8 @@ class MainWindow(QMainWindow):
             return (0, 0, 0, 0)
         if v == "white":
             return (255, 255, 255, 255)
+        if v == "#EEEFF1":
+            return (238, 239, 241, 255)
         return (0, 0, 0, 255)
 
     def update_preview(self):
@@ -595,6 +597,8 @@ class MainWindow(QMainWindow):
                         self.fill_combo.setCurrentText("transparent")
                     elif saved_fill == (255, 255, 255, 255):
                         self.fill_combo.setCurrentText("white")
+                    elif saved_fill == (238, 239, 241, 255):
+                        self.fill_combo.setCurrentText("#EEEFF1")
                     else:
                         self.fill_combo.setCurrentText("black")
             self.update_preview()
