@@ -30,7 +30,8 @@ def _resolve_out_path(out_path, policy):
 
 
 def process_one(path, out_dir, canvas_w, canvas_h, margins, anchor, fill, fmt,
-                conflict_policy="overwrite", max_retries=3, retry_delay=1.5):
+                conflict_policy="overwrite", max_retries=3, retry_delay=1.5,
+                hard_alpha=True, alpha_threshold=200):
     import time
 
     # --- open source image (may be locked by another app) ---
@@ -49,7 +50,8 @@ def process_one(path, out_dir, canvas_w, canvas_h, margins, anchor, fill, fmt,
         return "failed"
 
     try:
-        fg = remove_background(img)
+        fg = remove_background(img, hard_alpha=hard_alpha,
+                               alpha_threshold=alpha_threshold)
         if not has_foreground(fg):
             print(f"  skip (no foreground): {path}")
             return "skipped_no_fg"
@@ -115,6 +117,12 @@ def main():
                         "'ask' behaves like 'overwrite'.")
     p.add_argument("--max-retries", type=int, default=3,
                    help="Retries when a file is locked by another app (default: 3).")
+    p.add_argument("--hard-alpha", action="store_true", default=True,
+                   help="Threshold alpha to hard edges (0/255) to remove grey border (default: enabled).")
+    p.add_argument("--no-hard-alpha", action="store_false", dest="hard_alpha",
+                   help="Preserve soft alpha matte from rembg (anti-aliased edges, possible grey halo).")
+    p.add_argument("--alpha-threshold", type=int, default=200,
+                   help="Alpha >= threshold becomes opaque; below becomes transparent (default: 200).")
     args = p.parse_args()
 
     in_dir = args.input
@@ -140,7 +148,9 @@ def main():
             result = process_one(f, out_dir, args.w, args.h, margins,
                                  args.anchor, fill, args.fmt,
                                  conflict_policy=args.conflict_policy,
-                                 max_retries=args.max_retries)
+                                 max_retries=args.max_retries,
+                                 hard_alpha=args.hard_alpha,
+                                 alpha_threshold=args.alpha_threshold)
             stats[result] = stats.get(result, 0) + 1
         except Exception as e:
             print(f"  ERROR {f}: {e}")

@@ -69,10 +69,40 @@ def ensure_model_ready(
     return _session
 
 
-def remove_background(img: Image.Image) -> Image.Image:
+def remove_background(
+    img: Image.Image,
+    hard_alpha: bool = True,
+    alpha_threshold: int = 200,
+) -> Image.Image:
+    """Remove background and optionally collapse semi-transparent alpha edges
+    to hard (0 / 255) alpha.
+
+    rembg's u2net model emits a soft alpha matte with edge pixels whose alpha
+    is between 0 and 255. When that soft matte is composited onto a fill
+    canvas (aligner.paste with mask=product), those edge pixels blend the
+    subject colour with the fill colour, producing a visible grey/dark halo
+    around the object. Thresholding alpha removes the mid-range pixels so the
+    paste composites with no blending, eliminating the grey border.
+
+    Parameters
+    ----------
+    img:
+        Source RGBA/RGB image.
+    hard_alpha:
+        When True, threshold the alpha channel so every pixel is either fully
+        opaque or fully transparent. When False, the soft alpha matte from
+        rembg is preserved (anti-aliased edges, but possible grey halo).
+    alpha_threshold:
+        Alpha values >= this become 255; below this become 0. Only used when
+        ``hard_alpha`` is True.
+    """
     out = remove(img, session=_get_session())
     if out.mode != "RGBA":
         out = out.convert("RGBA")
+    if hard_alpha:
+        r, g, b, a = out.split()
+        a = a.point(lambda p: 255 if p >= alpha_threshold else 0)
+        out = Image.merge("RGBA", (r, g, b, a))
     return out
 
 

@@ -18,6 +18,7 @@ def resource_path(relative_path):
 
 class PreviewSignals(QObject):
     done = pyqtSignal(object)
+    batch_done = pyqtSignal(dict)
 
 class WorkerSignals(QObject):
     progress = pyqtSignal(int, int)
@@ -97,7 +98,11 @@ class ProcessWorker(threading.Thread):
                     if bg_mode == "Keep original":
                         fg = img.copy()
                     else:
-                        fg = remove_background(img)
+                        fg = remove_background(
+                            img,
+                            hard_alpha=s_per.get("hard_alpha", True),
+                            alpha_threshold=int(s_per.get("alpha_threshold", 200)),
+                        )
                 if not has_foreground(fg):
                     self.signals.status.emit(f"skip (no foreground): {os.path.basename(f)}")
                     stats["skipped_no_fg"] += 1
@@ -301,7 +306,9 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self.prev_signals = PreviewSignals()
         self.prev_signals.done.connect(self._on_preview_fg)
+        self.prev_signals.batch_done.connect(self._on_batch_fg_done)
         self._model_ready = True  # model preloaded in main() before MainWindow
+        self._bg_busy = False  # guards concurrent batch background-removal
         # Default processing settings (persisted to JSON)
         self.default_settings = {}
         self._defaults_path = os.path.join(
@@ -348,6 +355,7 @@ class MainWindow(QMainWindow):
         ctrl.addLayout(row)
 
         self.sliders = {}
+        self.slider_value_labels = {}
         for name in ("top", "bottom", "left", "right"):
             r = QHBoxLayout()
             r.addWidget(QLabel(name.capitalize()))
@@ -358,6 +366,7 @@ class MainWindow(QMainWindow):
             self.sliders[name] = s
             r.addWidget(s)
             v = QLabel("50")
+            self.slider_value_labels[name] = v
             s.valueChanged.connect(lambda val, lbl=v: lbl.setText(str(val)))
             r.addWidget(v)
             ctrl.addLayout(r)
@@ -404,6 +413,29 @@ class MainWindow(QMainWindow):
         self.bg_mode.currentTextChanged.connect(self._on_bg_mode_changed)
         ctrl.addWidget(QLabel("Background"))
         ctrl.addWidget(self.bg_mode)
+
+        # --- Hard alpha edge control (removes grey border on removed-bg images) ---
+        ha_row = QHBoxLayout()
+        self.hard_alpha = QCheckBox("Hard alpha edges (remove grey border)")
+        self.hard_alpha.setChecked(True)
+        self.hard_alpha.setToolTip(
+            "Thresholds the alpha matte so edge pixels are fully opaque or "
+            "fully transparent, eliminating the grey/soft halo around cut-out objects."
+        )
+        self.hard_alpha.stateChanged.connect(self._on_edge_settings_changed)
+        ha_row.addWidget(self.hard_alpha)
+        ha_row.addWidget(QLabel("Alpha threshold"))
+        self.alpha_threshold = QSpinBox()
+        self.alpha_threshold.setRange(0, 255)
+        self.alpha_threshold.setValue(200)
+        self.alpha_threshold.setToolTip(
+            "Alpha >= threshold becomes opaque; below becomes transparent. "
+            "Lower keeps more edge pixels, higher gives a tighter cut-out."
+        )
+        self.alpha_threshold.valueChanged.connect(self._on_edge_settings_changed)
+        ha_row.addWidget(self.alpha_threshold)
+        ha_row.addStretch()
+        ctrl.addLayout(ha_row)
 
         btn_apply_sel = QPushButton("Apply to selected")
         btn_apply_sel.clicked.connect(self.apply_to_selected)
@@ -518,6 +550,11 @@ class MainWindow(QMainWindow):
                 self.update_preview()
             # Auto-apply default settings to all newly loaded images
             self._apply_defaults_to_new_files(self.files)
+            # Auto-select the current (first) open image so its settings are
+            # synced and background removal applies on open when the default
+            # bg_mode is "Remove background".
+            if self.files:
+                self._activate_image(self.files[0])
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
             self.status_label.setText(f"err: {e}")
@@ -674,9 +711,25 @@ class MainWindow(QMainWindow):
             return
         self.status_label.setText("Removing background (preview)...")
         def worker():
-            fg = remove_background(self._sample_img.copy())
+            fg = remove_background(
+                self._sample_img.copy(),
+                hard_alpha=self.hard_alpha.isChecked(),
+                alpha_threshold=self.alpha_threshold.value(),
+            )
             self.prev_signals.done.emit(fg)
         threading.Thread(target=worker, daemon=True).start()
+
+    def _on_edge_settings_changed(self):
+        """Recompute the foreground when hard alpha / threshold change.
+
+        ``update_preview()`` only re-composites the *cached* foreground, so
+        toggling hard alpha or moving the threshold would look identical
+        unless the background removal is re-run with the new settings.
+        """
+        if self.bg_mode.currentText() == "Remove background":
+            self.remove_bg_preview()
+        else:
+            self.update_preview()
 
     def _on_preview_fg(self, fg):
         if fg is None:
@@ -688,6 +741,65 @@ class MainWindow(QMainWindow):
             self.image_fg[self._current_file] = fg
         self.status_label.setText("Preview ready")
         self.update_preview()
+        # Keep the gallery "[bg removed]" badge in sync for the current image.
+        self._refresh_gallery_badge(self._current_file)
+
+    def _refresh_gallery_badge(self, path):
+        """Update the "[bg removed]" badge for *path* without changing selection."""
+        if not path:
+            return
+        for i in range(self.gallery.count()):
+            it = self.gallery.item(i)
+            if it.data(Qt.ItemDataRole.UserRole) == path:
+                name = os.path.basename(path)
+                if path in self.image_fg:
+                    name = name + "  [bg removed]"
+                it.setText(name)
+                it.setToolTip(path)
+                break
+
+    def _remove_bg_batch(self, paths):
+        """Remove background for multiple files on a background thread.
+
+        Emits ``batch_done`` with {path: fg_image} when finished so the GUI
+        can cache results and refresh badges/preview on the main thread.
+        """
+        def worker():
+            fg_map = {}
+            for p in paths:
+                try:
+                    img = Image.open(p).convert("RGBA")
+                    fg = remove_background(
+                        img,
+                        hard_alpha=self.hard_alpha.isChecked(),
+                        alpha_threshold=self.alpha_threshold.value(),
+                    )
+                    fg_map[p] = fg
+                except Exception as e:  # noqa: BLE001
+                    self.status_label.setText(f"bg err {os.path.basename(p)}: {e}")
+            self.prev_signals.batch_done.emit(fg_map)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_batch_fg_done(self, fg_map):
+        self._bg_busy = False
+        if not fg_map:
+            return
+        self.image_fg.update(fg_map)
+        # Refresh gallery badges while preserving the current selection.
+        cur = self._current_file
+        sel = [it.data(Qt.ItemDataRole.UserRole) for it in self.gallery.selectedItems()]
+        self._populate_gallery()
+        self._current_file = cur
+        for i in range(self.gallery.count()):
+            it = self.gallery.item(i)
+            if it.data(Qt.ItemDataRole.UserRole) in sel:
+                it.setSelected(True)
+        # If the current image just got a foreground, refresh its preview.
+        if cur and cur in fg_map:
+            self._sample_fg = fg_map[cur]
+            self.update_preview()
+        self.status_label.setText("Background removal ready")
 
     def _on_bg_mode_changed(self, text):
         if self._sample_img is None or not self._current_file:
@@ -700,6 +812,7 @@ class MainWindow(QMainWindow):
             self._sample_fg = self._sample_img.copy()
             self.image_fg[self._current_file] = self._sample_fg
             self.update_preview()
+            self._refresh_gallery_badge(self._current_file)
             self.status_label.setText("Background kept")
 
     def _populate_gallery(self):
@@ -747,6 +860,13 @@ class MainWindow(QMainWindow):
                 self.sliders["top"].setValue(s["margins"].top); self.sliders["bottom"].setValue(s["margins"].bottom)
                 self.sliders["left"].setValue(s["margins"].left); self.sliders["right"].setValue(s["margins"].right)
                 self.anchor.setCurrentText(s["anchor"])
+                # restore saved hard alpha settings
+                ha = s.get("hard_alpha")
+                if ha is not None:
+                    self.hard_alpha.setChecked(bool(ha))
+                at = s.get("alpha_threshold")
+                if at is not None:
+                    self.alpha_threshold.setValue(int(at))
                 # restore saved fill onto the combo (triggers preview only, not a settings write)
                 saved_fill = s.get("fill")
                 if saved_fill is not None:
@@ -774,6 +894,24 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"Selected: {os.path.basename(p)}")
         except Exception as e:
             self.status_label.setText(f"err: {e}")
+
+    def _activate_image(self, path):
+        """Select *path* in the gallery and sync UI/settings to it.
+
+        Also triggers background-removal preview when the image's saved
+        ``bg_mode`` is "Remove background" and no foreground is cached yet
+        (i.e. "default apply on open" / auto-select on the current open image).
+        """
+        if not path:
+            return
+        for i in range(self.gallery.count()):
+            it = self.gallery.item(i)
+            if it.data(Qt.ItemDataRole.UserRole) == path:
+                self.gallery.setCurrentItem(it)
+                it.setSelected(True)
+                self.gallery.scrollToItem(it)
+                self._on_gallery_click(it)
+                break
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -832,6 +970,9 @@ class MainWindow(QMainWindow):
                 # Auto-apply default settings to newly added images
                 if new_paths:
                     self._apply_defaults_to_new_files(new_paths)
+                # Auto-select the current (first) open image.
+                if self.files:
+                    self._activate_image(self.files[0])
             event.acceptProposedAction()
         except Exception as e:
             self.status_label.setText(f"drop err: {e}")
@@ -842,7 +983,9 @@ class MainWindow(QMainWindow):
                     left=self.sliders["left"].value(), right=self.sliders["right"].value())
         return {"w": self.spin_w.value(), "h": self.spin_h.value(),
                 "margins": m, "anchor": self.anchor.currentText(),
-                "fill": self._fill(), "bg_mode": self.bg_mode.currentText()}
+                "fill": self._fill(), "bg_mode": self.bg_mode.currentText(),
+                "hard_alpha": self.hard_alpha.isChecked(),
+                "alpha_threshold": self.alpha_threshold.value()}
 
     # ------------------------------------------------------------------
     # Default settings persistence
@@ -862,6 +1005,8 @@ class MainWindow(QMainWindow):
                 "anchor": self.default_settings.get("anchor", self.anchor.currentText()),
                 "fill": list(self.default_settings.get("fill", self._fill())),
                 "bg_mode": self.default_settings.get("bg_mode", self.bg_mode.currentText()),
+                "hard_alpha": self.default_settings.get("hard_alpha", self.hard_alpha.isChecked()),
+                "alpha_threshold": self.default_settings.get("alpha_threshold", self.alpha_threshold.value()),
             }
             with open(self._defaults_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -890,6 +1035,8 @@ class MainWindow(QMainWindow):
                         "anchor": data.get("anchor", "center"),
                         "fill": tuple(fill) if isinstance(fill, list) and len(fill) == 4 else (0, 0, 0, 255),
                         "bg_mode": data.get("bg_mode", "Remove background"),
+                        "hard_alpha": data.get("hard_alpha", True),
+                        "alpha_threshold": int(data.get("alpha_threshold", 200)),
                     }
         except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
             self.status_label.setText(f"Warning: could not load default settings: {e}")
@@ -934,6 +1081,7 @@ class MainWindow(QMainWindow):
             # before an image is loaded.
             widgets = [
                 self.spin_w, self.spin_h, self.anchor, self.bg_mode, self.fill_combo,
+                self.hard_alpha, self.alpha_threshold,
             ] + list(self.sliders.values())
             for w in widgets:
                 w.blockSignals(True)
@@ -953,6 +1101,12 @@ class MainWindow(QMainWindow):
                 self.sliders["bottom"].setValue(int(m.get("bottom", 0)))
                 self.sliders["left"].setValue(int(m.get("left", 0)))
                 self.sliders["right"].setValue(int(m.get("right", 0)))
+            # Sync the numeric value labels (signals were blocked so they
+            # didn't update automatically when setValue() fired).
+            for name, slider in self.sliders.items():
+                lbl = self.slider_value_labels.get(name)
+                if lbl is not None:
+                    lbl.setText(str(slider.value()))
 
             anchor = s.get("anchor")
             if anchor:
@@ -961,6 +1115,14 @@ class MainWindow(QMainWindow):
             bg_mode = s.get("bg_mode")
             if bg_mode:
                 self.bg_mode.setCurrentText(bg_mode)
+
+            hard_alpha = s.get("hard_alpha")
+            if hard_alpha is not None:
+                self.hard_alpha.setChecked(bool(hard_alpha))
+
+            alpha_threshold = s.get("alpha_threshold")
+            if alpha_threshold is not None:
+                self.alpha_threshold.setValue(int(alpha_threshold))
 
             # Map saved fill RGBA back to a combo display name.
             fill = s.get("fill")
@@ -1002,9 +1164,24 @@ class MainWindow(QMainWindow):
                     selected = [self._current_file]
                 else:
                     selected = [self.files[0]]
+            to_remove = []
             for p in selected:
-                self.image_settings[p] = s
-            self.status_label.setText(f"Applied settings to {len(selected)} image(s). Tip: Ctrl/Shift-click to multi-select.")
+                # Store a copy per image so settings are not shared by reference.
+                self.image_settings[p] = dict(s)
+                if s.get("bg_mode") == "Remove background" and p not in self.image_fg:
+                    to_remove.append(p)
+            if to_remove and not self._bg_busy:
+                self._bg_busy = True
+                self._remove_bg_batch(to_remove)
+                self.status_label.setText(
+                    f"Applied settings to {len(selected)} image(s); "
+                    f"removing background for {len(to_remove)}..."
+                )
+            else:
+                self.status_label.setText(
+                    f"Applied settings to {len(selected)} image(s). "
+                    "Tip: Ctrl/Shift-click to multi-select."
+                )
         except Exception as e:
             self.status_label.setText(f"apply err: {e}")
 
@@ -1017,10 +1194,22 @@ class MainWindow(QMainWindow):
         try:
             s = self._current_settings()
             s["bg_mode"] = self.bg_mode.currentText()
+            to_remove = []
             for p in self.files:
-                self.image_settings[p] = s
-            self.update_preview()
-            self.status_label.setText(f"Applied settings to all {len(self.files)} images")
+                # Store a copy per image so settings are not shared by reference.
+                self.image_settings[p] = dict(s)
+                if s.get("bg_mode") == "Remove background" and p not in self.image_fg:
+                    to_remove.append(p)
+            if to_remove and not self._bg_busy:
+                self._bg_busy = True
+                self._remove_bg_batch(to_remove)
+                self.status_label.setText(
+                    f"Applied settings to all {len(self.files)} images; "
+                    f"removing background for {len(to_remove)}..."
+                )
+            else:
+                self.update_preview()
+                self.status_label.setText(f"Applied settings to all {len(self.files)} images")
         except Exception as e:
             self.status_label.setText(f"apply err: {e}")
         self.status_label.setText("Applied settings to all images. Use Process All to export.")

@@ -2,17 +2,19 @@
   "w": 1000,
   "h": 1000,
   "margins": {
-    "top": 50,
-    "bottom": 50,
+    "top": 100,
+    "bottom": 100,
     "left": 50,
     "right": 50
   },
   "anchor": "center",
   "fill": [
-    0,
-    0,
-    0,
-    0
+    238,
+    239,
+    241,
+    255
   ],
-  "bg_mode": "Remove background"
+  "bg_mode": "Remove background",
+  "hard_alpha": true,
+  "alpha_threshold": 200
 }
