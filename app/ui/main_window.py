@@ -282,13 +282,27 @@ def pil_to_pixmap(img: Image.Image, max_w=260, max_h=260):
     data = img.tobytes("raw", "RGBA")
     qimg = QImage(data, img.width, img.height, QImage.Format.Format_RGBA8888)
     return QPixmap.fromImage(qimg)
+# Factory system defaults — used by "Reset to System Default" and as the
+# fallback when default_settings.json is missing or corrupt.
+SYSTEM_DEFAULTS = {
+    "w": 1000,
+    "h": 1000,
+    "margins": {"top": 100, "bottom": 100, "left": 50, "right": 50},
+    "anchor": "center",
+    "fill": [238, 239, 241, 255],
+    "bg_mode": "Remove background",
+    "hard_alpha": True,
+    "alpha_threshold": 200,
+}
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Bulk Image BG Remover + Resizer + Aligner")
         self.setWindowIcon(QIcon(resource_path("logo.png")))
-        self.resize(1000, 700)
-        self.setMinimumSize(900, 650)
+        self.resize(1000, 800)
+        self.setMinimumSize(900, 700)
         self.files = []
         self.image_settings = {}
         self.image_fg = {}
@@ -310,7 +324,7 @@ class MainWindow(QMainWindow):
         self._model_ready = True  # model preloaded in main() before MainWindow
         self._bg_busy = False  # guards concurrent batch background-removal
         # Default processing settings (persisted to JSON)
-        self.default_settings = {}
+        self.default_settings = dict(SYSTEM_DEFAULTS)
         self._defaults_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "default_settings.json"
         )
@@ -447,6 +461,11 @@ class MainWindow(QMainWindow):
         btn_set_default.setToolTip("Save current settings as defaults for all newly added images")
         btn_set_default.clicked.connect(self._set_defaults)
         ctrl.addWidget(btn_set_default)
+
+        btn_reset_default = QPushButton("Reset to System Default")
+        btn_reset_default.setToolTip("Restore factory default settings (bg mode, hard alpha, threshold, canvas, margins, fill)")
+        btn_reset_default.clicked.connect(self._reset_to_system_default)
+        ctrl.addWidget(btn_reset_default)
 
         btn_remove = QPushButton("Remove Selected")
         btn_remove.clicked.connect(self.remove_selected)
@@ -993,14 +1012,24 @@ class MainWindow(QMainWindow):
     def _save_default_settings(self):
         """Persist default settings to JSON file."""
         try:
+            m = self.default_settings.get("margins", Margins())
+            if isinstance(m, Margins):
+                m_top, m_bottom, m_left, m_right = m.top, m.bottom, m.left, m.right
+            elif isinstance(m, dict):
+                m_top = int(m.get("top", 0))
+                m_bottom = int(m.get("bottom", 0))
+                m_left = int(m.get("left", 0))
+                m_right = int(m.get("right", 0))
+            else:
+                m_top = m_bottom = m_left = m_right = 0
             data = {
                 "w": self.default_settings.get("w", self.spin_w.value()),
                 "h": self.default_settings.get("h", self.spin_h.value()),
                 "margins": {
-                    "top": self.default_settings.get("margins", Margins()).top,
-                    "bottom": self.default_settings.get("margins", Margins()).bottom,
-                    "left": self.default_settings.get("margins", Margins()).left,
-                    "right": self.default_settings.get("margins", Margins()).right,
+                    "top": m_top,
+                    "bottom": m_bottom,
+                    "left": m_left,
+                    "right": m_right,
                 },
                 "anchor": self.default_settings.get("anchor", self.anchor.currentText()),
                 "fill": list(self.default_settings.get("fill", self._fill())),
@@ -1040,7 +1069,7 @@ class MainWindow(QMainWindow):
                     }
         except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
             self.status_label.setText(f"Warning: could not load default settings: {e}")
-            self.default_settings = {}
+            self.default_settings = dict(SYSTEM_DEFAULTS)
 
     def _set_defaults(self):
         """Save current UI settings as the default for all new images."""
@@ -1056,6 +1085,22 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Default settings saved. New images will use these automatically.")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not set defaults: {e}")
+
+    def _reset_to_system_default(self):
+        """Restore factory default settings, save them, and refresh the UI."""
+        try:
+            self.default_settings = dict(SYSTEM_DEFAULTS)
+            self._save_default_settings()
+            self._apply_defaults_to_ui()
+            # Apply system defaults to all currently loaded images that lack settings
+            if self.files:
+                s = dict(self.default_settings)
+                for p in self.files:
+                    if p not in self.image_settings:
+                        self.image_settings[p] = dict(s)
+            self.status_label.setText("Reset to system default settings.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not reset defaults: {e}")
 
     def _apply_defaults_to_new_files(self, paths):
         """Apply saved default settings to a list of newly added file paths."""
@@ -1127,18 +1172,19 @@ class MainWindow(QMainWindow):
             # Map saved fill RGBA back to a combo display name.
             fill = s.get("fill")
             if fill is not None:
+                fill_t = tuple(fill) if isinstance(fill, (list, tuple)) else fill
                 name = None
-                if fill == (0, 0, 0, 0):
+                if fill_t == (0, 0, 0, 0):
                     name = "transparent"
-                elif fill == (255, 255, 255, 255):
+                elif fill_t == (255, 255, 255, 255):
                     name = "white"
-                elif fill == (238, 239, 241, 255):
+                elif fill_t == (238, 239, 241, 255):
                     name = "Light Grey"
-                elif fill == (0, 0, 0, 255):
+                elif fill_t == (0, 0, 0, 255):
                     name = "black"
                 else:
                     for cname, crgba in self.custom_colors.items():
-                        if crgba == fill:
+                        if tuple(crgba) == fill_t:
                             name = cname
                             break
                 if name is not None:
