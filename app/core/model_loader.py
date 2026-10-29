@@ -10,8 +10,11 @@ callbacks and MD5 verification so the UI layer can present a native
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
+import socket
+import urllib.error
 import urllib.request
 from typing import Callable, Optional
 
@@ -24,6 +27,80 @@ MODEL_FILE_NAME = "u2net.onnx"
 
 ProgressCallback = Callable[[int, int], None]          # (bytes_read, total_bytes)
 StatusCallback = Callable[[str], None]
+
+
+class ModelDownloadError(RuntimeError):
+    """Raised when the u2net model cannot be downloaded.
+
+    Attributes
+    ----------
+    no_internet : bool
+        ``True`` when the failure looks like a connectivity problem (no
+        internet / DNS failure / refused connection) as opposed to an HTTP
+        error, checksum mismatch, or local I/O problem.
+    """
+
+    def __init__(self, message: str, no_internet: bool = False) -> None:
+        super().__init__(message)
+        self.no_internet = no_internet
+
+
+def _looks_like_network_error(exc: BaseException) -> bool:
+    """Classify an exception raised by ``urllib.request.urlopen``.
+
+    Returns ``True`` when the failure looks like a connectivity problem
+    (no internet, DNS failure, refused/reset connection, timeout).
+
+    HTTP responses that *did* reach the server (e.g. 404, 403, 500) are
+    considered **not** a network error, because that proves internet access
+    exists — the server simply rejected or could not serve the model.
+    """
+    # urllib wraps socket-level failures in URLError.
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        # Server responded with an HTTP status code → internet is present.
+        if isinstance(reason, urllib.error.HTTPError):
+            return False
+        # DNS resolution failure.
+        if isinstance(reason, socket.gaierror):
+            return True
+        # Other socket / OS errors → inspect errno.
+        if isinstance(reason, OSError):
+            err = getattr(reason, "errno", None)
+            _network_errnos = {
+                errno.ENETUNREACH,   # network unreachable
+                errno.ECONNREFUSED,  # connection refused
+                errno.ECONNRESET,    # connection reset by peer
+                errno.ETIMEDOUT,     # timed out
+                errno.EHOSTUNREACH,  # host unreachable
+            }
+            # EAI_* codes exist on Unix but not always on Windows.
+            for _name in ("EAI_AGAIN", "EAI_FAIL"):  # temporary / fatal DNS failure
+                _val = getattr(errno, _name, None)
+                if _val is not None:
+                    _network_errnos.add(_val)
+            if err in _network_errnos:
+                return True
+        return True  # any other URLError → treat as network problem
+
+    # Bare socket errors (raised before urllib wraps them).
+    if isinstance(exc, (socket.timeout, socket.gaierror, OSError)):
+        err = getattr(exc, "errno", None)
+        if isinstance(exc, socket.timeout):
+            return True
+        if isinstance(exc, socket.gaierror):
+            return True
+        if isinstance(exc, OSError) and err in (
+            errno.ENETUNREACH,
+            errno.ECONNREFUSED,
+            errno.ECONNRESET,
+            errno.ETIMEDOUT,
+            errno.EHOSTUNREACH,
+        ):
+            return True
+        return isinstance(exc, OSError)  # treat OSErrors as network issues
+
+    return False
 
 
 def _get_rembg_home() -> str:
@@ -145,7 +222,10 @@ def download_model(
     except Exception as exc:  # noqa: BLE001 -- surface any error to caller
         if os.path.isfile(tmp_path):
             os.remove(tmp_path)
-        raise RuntimeError(f"Failed to download model: {exc}") from exc
+        raise ModelDownloadError(
+            f"Failed to download model: {exc}",
+            no_internet=_looks_like_network_error(exc),
+        ) from exc
 
     # Atomic rename to final location.
     os.replace(tmp_path, model_path)

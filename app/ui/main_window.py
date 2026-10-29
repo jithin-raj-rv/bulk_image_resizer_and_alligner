@@ -309,6 +309,7 @@ class MainWindow(QMainWindow):
         )
         self._load_custom_colors()
         self._load_default_settings()
+        self._apply_defaults_to_ui()
         self.signals = WorkerSignals()
         self.signals.progress.connect(self.on_progress)
         self.signals.status.connect(self.status_label.setText)
@@ -924,6 +925,71 @@ class MainWindow(QMainWindow):
                 f"Default settings applied to {applied} new image(s)."
             )
 
+    def _apply_defaults_to_ui(self):
+        """Push saved default settings onto the UI controls at startup."""
+        if not self.default_settings:
+            return
+        try:
+            # Block signals so setting values does not trigger update_preview()
+            # before an image is loaded.
+            widgets = [
+                self.spin_w, self.spin_h, self.anchor, self.bg_mode, self.fill_combo,
+            ] + list(self.sliders.values())
+            for w in widgets:
+                w.blockSignals(True)
+
+            s = self.default_settings
+            self.spin_w.setValue(int(s.get("w", self.spin_w.value())))
+            self.spin_h.setValue(int(s.get("h", self.spin_h.value())))
+
+            m = s.get("margins")
+            if isinstance(m, Margins):
+                self.sliders["top"].setValue(m.top)
+                self.sliders["bottom"].setValue(m.bottom)
+                self.sliders["left"].setValue(m.left)
+                self.sliders["right"].setValue(m.right)
+            elif isinstance(m, dict):
+                self.sliders["top"].setValue(int(m.get("top", 0)))
+                self.sliders["bottom"].setValue(int(m.get("bottom", 0)))
+                self.sliders["left"].setValue(int(m.get("left", 0)))
+                self.sliders["right"].setValue(int(m.get("right", 0)))
+
+            anchor = s.get("anchor")
+            if anchor:
+                self.anchor.setCurrentText(anchor)
+
+            bg_mode = s.get("bg_mode")
+            if bg_mode:
+                self.bg_mode.setCurrentText(bg_mode)
+
+            # Map saved fill RGBA back to a combo display name.
+            fill = s.get("fill")
+            if fill is not None:
+                name = None
+                if fill == (0, 0, 0, 0):
+                    name = "transparent"
+                elif fill == (255, 255, 255, 255):
+                    name = "white"
+                elif fill == (238, 239, 241, 255):
+                    name = "Light Grey"
+                elif fill == (0, 0, 0, 255):
+                    name = "black"
+                else:
+                    for cname, crgba in self.custom_colors.items():
+                        if crgba == fill:
+                            name = cname
+                            break
+                if name is not None:
+                    self.fill_combo.setCurrentText(name)
+        except Exception as e:
+            self.status_label.setText(f"Warning: could not apply defaults to UI: {e}")
+        finally:
+            for w in widgets:
+                try:
+                    w.blockSignals(False)
+                except Exception:
+                    pass
+
     def apply_to_selected(self):
         try:
             if not self.files:
@@ -1187,21 +1253,48 @@ def create_main_window(app: QApplication | None = None, splash=None):
     # user-facing progress dialog.  This replaces the old silent
     # background initialization.  The model is then reused by every
     # subsequent call to remove_background().
+    #
+    # Retries on a network failure so the user can reconnect and try
+    # again instead of the app exiting immediately.
     # ---------------------------------------------------------------
     from app.ui.model_load_dialog import ModelLoadDialog
 
-    dialog = ModelLoadDialog()
-    worker, thread = ModelLoadDialog.start_worker(dialog)
-    thread.started.connect(worker.run)
-    thread.start()
-    dialog.exec()  # blocks on its own event loop; worker signals update it
+    while True:
+        dialog = ModelLoadDialog()
+        worker, thread = ModelLoadDialog.start_worker(dialog)
+        thread.started.connect(worker.run)
+        thread.start()
+        dialog.exec()  # blocks on its own event loop; worker signals update it
 
-    # Clean up thread
-    if thread.isRunning():
-        thread.quit()
-        thread.wait(2000)
+        # Clean up thread
+        if thread.isRunning():
+            thread.quit()
+            thread.wait(2000)
 
-    if dialog.result() == 0:  # Rejected → model failed to load
+        if dialog.result() != 0:  # Accepted → model ready
+            break
+
+        # Rejected → model failed to load.
+        if getattr(dialog, "_network_error", False):
+            # Ask whether to retry (user may have reconnected) or exit.
+            reply = QMessageBox.critical(
+                None,
+                "No Internet Connection",
+                (
+                    "The background-removal model (~176 MB) could not be "
+                    "downloaded because there is no internet connection.\n\n"
+                    "Please check your network and click Retry, or click "
+                    "Abort to close the application.\n\n"
+                    f"Details: {getattr(dialog, '_last_error', '')}"
+                ),
+                QMessageBox.StandardButton.Retry
+                | QMessageBox.StandardButton.Abort,
+                QMessageBox.StandardButton.Retry,
+            )
+            if reply == QMessageBox.StandardButton.Retry:
+                continue  # retry the download
+            sys.exit(1)
+
         QMessageBox.critical(
             None,
             "Startup Error",

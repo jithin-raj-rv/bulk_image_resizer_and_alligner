@@ -21,13 +21,15 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from app.core.model_loader import ModelDownloadError
+
 
 class ModelLoaderSignals(QObject):
     """Signal bundle emitted by :class:`ModelLoaderWorker`."""
 
     progress = pyqtSignal(int, int)          # (bytes_read, total_bytes)
     status = pyqtSignal(str)
-    finished = pyqtSignal(bool, str)         # (success, error_message)
+    finished = pyqtSignal(bool, str, bool)   # (success, error_message, network_error)
 
 
 class ModelLoaderWorker(QObject):
@@ -53,9 +55,11 @@ class ModelLoaderWorker(QObject):
                 progress_cb=lambda rb, tb: self.signals.progress.emit(rb, tb),
                 status_cb=lambda msg: self.signals.status.emit(msg),
             )
-            self.signals.finished.emit(True, "")
+            self.signals.finished.emit(True, "", False)
+        except ModelDownloadError as exc:  # noqa: BLE001
+            self.signals.finished.emit(False, str(exc), exc.no_internet)
         except Exception as exc:  # noqa: BLE001
-            self.signals.finished.emit(False, str(exc))
+            self.signals.finished.emit(False, str(exc), False)
 
 
 class ModelLoadDialog(QDialog):
@@ -78,6 +82,8 @@ class ModelLoadDialog(QDialog):
         )
         self.setMinimumWidth(420)
         self._download_complete = False
+        self._last_error = ""
+        self._network_error = False
 
         # --- layout -------------------------------------------------------
         layout = QVBoxLayout(self)
@@ -135,6 +141,16 @@ class ModelLoadDialog(QDialog):
             self._size_label.setText(f"{mb_read:.1f} MB downloaded")
 
     # ------------------------------------------------------------------
+    # Result handling — stores the error info so the caller can inspect it
+    # after dialog.exec() returns.
+    # ------------------------------------------------------------------
+    def _on_finished(self, ok: bool, err: str, network_error: bool) -> None:
+        """Store the worker result and accept or reject the dialog."""
+        self._last_error = err
+        self._network_error = network_error
+        self.accept() if ok else self.reject()
+
+    # ------------------------------------------------------------------
     # Convenience factory — wires up worker + thread in one call
     # ------------------------------------------------------------------
     @staticmethod
@@ -152,9 +168,5 @@ class ModelLoadDialog(QDialog):
         worker.moveToThread(thread)
         worker.signals.progress.connect(parent_dialog.set_progress_bytes)
         worker.signals.status.connect(parent_dialog.set_status)
-        worker.signals.finished.connect(
-            lambda ok, err: (
-                parent_dialog.accept() if ok else parent_dialog.reject()
-            )
-        )
+        worker.signals.finished.connect(parent_dialog._on_finished)
         return worker, thread
