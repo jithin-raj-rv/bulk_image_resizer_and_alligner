@@ -116,7 +116,7 @@ class ProcessWorker(threading.Thread):
                     canvas = align(fg, cw, ch, m, anc, fl)
                     stem = os.path.splitext(os.path.basename(f))[0]
                     ext = "png" if self.fmt == "png" else "jpg"
-                    out_path = os.path.join(self.out_dir, f"{stem}_processed.{ext}")
+                    out_path = os.path.join(self.out_dir, f"{stem}.{ext}")
                     if self.fmt == "jpg":
                         canvas = canvas.convert("RGB")
 

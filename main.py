@@ -59,7 +59,7 @@ def process_one(path, out_dir, canvas_w, canvas_h, margins, anchor, fill, fmt,
         canvas = align(fg, canvas_w, canvas_h, margins, anchor, fill)
         stem = os.path.splitext(os.path.basename(path))[0]
         ext = "png" if fmt == "png" else "jpg"
-        out_path = os.path.join(out_dir, f"{stem}_processed.{ext}")
+        out_path = os.path.join(out_dir, f"{stem}.{ext}")
         if fmt == "jpg":
             canvas = canvas.convert("RGB")
 
